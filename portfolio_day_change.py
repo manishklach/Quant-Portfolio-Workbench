@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Aggregate Day Change ($) by ticker from a pasted portfolio export."""
+"""Aggregate Day Change ($) from a portfolio export file."""
 
 from __future__ import annotations
 
@@ -139,15 +139,35 @@ def main() -> int:
         description="Aggregate Day Chng $ totals by ticker from a portfolio export."
     )
     parser.add_argument(
+        "filename",
+        nargs="?",
+        help="Path to a portfolio export file. If omitted, input is read from stdin.",
+    )
+    parser.add_argument(
+        "--ticker",
+        action="store_true",
+        help="Aggregate option symbols by underlying ticker (e.g., AAPL).",
+    )
+    parser.add_argument(
         "--underlying",
         action="store_true",
-        help="Group option symbols by underlying ticker (e.g., AAPL).",
+        help="Alias for --ticker.",
     )
+    if len(sys.argv) == 1:
+        parser.print_usage(sys.stderr)
+        return 1
+
     args = parser.parse_args()
 
-    raw_text = sys.stdin.read()
+    if args.filename:
+        try:
+            with open(args.filename, "r", encoding="utf-8-sig") as input_file:
+                raw_text = input_file.read()
+        except OSError as exc:
+            print(f"Could not read '{args.filename}': {exc}", file=sys.stderr)
+            return 1
     if not raw_text.strip():
-        print("No input provided. Paste the portfolio table and try again.", file=sys.stderr)
+        print(f"Input file '{args.filename}' is empty.", file=sys.stderr)
         return 1
 
     try:
@@ -156,7 +176,8 @@ def main() -> int:
         print(str(exc), file=sys.stderr)
         return 1
 
-    totals = aggregate_day_change(rows, symbol_key, day_change_key, args.underlying)
+    group_by_ticker = args.ticker or args.underlying
+    totals = aggregate_day_change(rows, symbol_key, day_change_key, group_by_ticker)
     if not totals:
         print("No Day Chng $ values found to aggregate.", file=sys.stderr)
         return 1
