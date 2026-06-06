@@ -28,6 +28,8 @@ NAMO_CHART_URL = "https://stockcharts.com/sc3/ui/?s=$namo"
 NYMO_CHART_URL = "https://stockcharts.com/sc3/ui/?s=$nymo"
 NAMO_ALT_CHART_URL = "https://marketcharts.com/indicators/breadth/$ndx.mccosc"
 NYMO_ALT_CHART_URL = "https://marketcharts.com/indicators/breadth/$nya.mccosc"
+SMH_MCCOSC_URL = "https://marketcharts.com/indicators/breadth/smh.mccosc"
+SMH_BREADTH_MENU_URL = "https://marketcharts.com/indicators/breadth/smh"
 
 
 def fetch_html(url: str) -> str:
@@ -148,6 +150,8 @@ def build_snapshot() -> dict[str, object]:
             "nymo_stockcharts": NYMO_CHART_URL,
             "namo_marketcharts": NAMO_ALT_CHART_URL,
             "nymo_marketcharts": NYMO_ALT_CHART_URL,
+            "smh_mcclellan_oscillator": SMH_MCCOSC_URL,
+            "smh_breadth_menu": SMH_BREADTH_MENU_URL,
         },
     }
 
@@ -208,11 +212,13 @@ def print_text_report(snapshot: dict[str, object], history_limit: int) -> None:
     print(f"  Chart: {pc_links['nasdaq_100_10d']}")
     print_history_block("Last Values", list(reversed(ndx["recent_history"][:history_limit])), history_limit)
 
-    print("\nNAMO / NYMO Chart Links")
+    print("\nBreadth / Oscillator Chart Links")
     print(f"  NAMO (StockCharts): {links['namo_stockcharts']}")
     print(f"  NYMO (StockCharts): {links['nymo_stockcharts']}")
     print(f"  NAMO (MarketCharts): {links['namo_marketcharts']}")
     print(f"  NYMO (MarketCharts): {links['nymo_marketcharts']}")
+    print(f"  SMH McClellan Oscillator: {links['smh_mcclellan_oscillator']}")
+    print(f"  SMH Breadth Menu: {links['smh_breadth_menu']}")
 
 
 def main() -> int:
