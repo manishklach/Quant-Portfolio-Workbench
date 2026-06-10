@@ -218,15 +218,22 @@ def get_quotes(tickers):
             except Exception:
                 pass
             last = fast.get("last_price", np.nan)
+            if pd.isna(last):
+                last = fast.get("lastPrice", np.nan)
             prev = fast.get("previous_close", np.nan)
+            if pd.isna(prev):
+                prev = fast.get("previousClose", np.nan)
+            if pd.isna(prev):
+                prev = fast.get("regularMarketPreviousClose", np.nan)
 
             if pd.isna(last) or pd.isna(prev):
                 hist = tk.history(period="5d", interval="1d", auto_adjust=False)
-                if len(hist) >= 2:
-                    prev = float(hist["Close"].iloc[-2])
-                    last = float(hist["Close"].iloc[-1])
-                elif len(hist) == 1:
-                    last = float(hist["Close"].iloc[-1])
+                closes = hist["Close"].dropna() if "Close" in hist else pd.Series(dtype=float)
+                if len(closes) >= 2:
+                    prev = float(closes.iloc[-2])
+                    last = float(closes.iloc[-1])
+                elif len(closes) == 1:
+                    last = float(closes.iloc[-1])
 
             chg = last - prev if not pd.isna(last) and not pd.isna(prev) else np.nan
             rows.append({"ticker": ticker, "last": last, "prev_close": prev, "stock_change": chg})

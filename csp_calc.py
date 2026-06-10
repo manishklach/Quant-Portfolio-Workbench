@@ -44,14 +44,19 @@ def fetch_current_stock_prices(tickers):
                 pass
 
             last_price = fast.get('last_price')
+            if last_price is None or pd.isna(last_price):
+                last_price = fast.get('lastPrice')
             if last_price is not None and not pd.isna(last_price):
                 prices[ticker] = float(last_price)
                 continue
 
             history = stock.history(period='5d', interval='1d', auto_adjust=False)
-            if history.empty:
+            if history.empty or 'Close' not in history:
                 continue
-            prices[ticker] = float(history['Close'].iloc[-1])
+            closes = history['Close'].dropna()
+            if closes.empty:
+                continue
+            prices[ticker] = float(closes.iloc[-1])
         except Exception:
             continue
     return prices
