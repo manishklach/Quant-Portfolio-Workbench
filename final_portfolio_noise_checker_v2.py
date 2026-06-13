@@ -220,11 +220,11 @@ def get_quotes(tickers):
             last = fast.get("last_price", np.nan)
             if pd.isna(last):
                 last = fast.get("lastPrice", np.nan)
-            prev = fast.get("previous_close", np.nan)
+            prev = fast.get("regularMarketPreviousClose", np.nan)
+            if pd.isna(prev):
+                prev = fast.get("previous_close", np.nan)
             if pd.isna(prev):
                 prev = fast.get("previousClose", np.nan)
-            if pd.isna(prev):
-                prev = fast.get("regularMarketPreviousClose", np.nan)
 
             if pd.isna(last) or pd.isna(prev):
                 hist = tk.history(period="5d", interval="1d", auto_adjust=False)

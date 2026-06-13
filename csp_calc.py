@@ -1,7 +1,9 @@
 """Estimate uncovered short put exposure and cash-secured capital required from a Schwab holdings export."""
 
 import argparse
+import math
 import random
+from datetime import datetime, timezone
 
 import pandas as pd
 from openpyxl import load_workbook
@@ -12,6 +14,9 @@ try:
     import yfinance as yf
 except ImportError:
     yf = None
+
+rISK_FREE_RATE = 0.045
+DIVIDEND_YIELD = 0.0
 
 
 FUNNY_STARTUP_MESSAGES = [
@@ -24,6 +29,71 @@ FUNNY_STARTUP_MESSAGES = [
     'Measuring how spicy these short puts really are...',
     'Politely asking the options chain to explain itself...',
 ]
+
+
+def norm_cdf(x):
+    return 0.5 * (1.0 + math.erf(x / math.sqrt(2)))
+
+
+def year_frac(expiration):
+    try:
+        exp_dt = pd.Timestamp(expiration).to_pydatetime().replace(tzinfo=timezone.utc)
+        now = datetime.now(timezone.utc)
+        return max((exp_dt - now).total_seconds() / 86400.0 / 365.0, 1 / 365)
+    except Exception:
+        return float("nan")
+
+
+def bs_put_delta(spot, strike, time_to_expiry, rate, sigma, dividend_yield=0.0):
+    if any(pd.isna(value) for value in [spot, strike, time_to_expiry, rate, sigma, dividend_yield]):
+        return float("nan")
+    if spot <= 0 or strike <= 0 or time_to_expiry <= 0 or sigma <= 0:
+        return float("nan")
+    d1 = (
+        math.log(spot / strike)
+        + (rate - dividend_yield + 0.5 * sigma * sigma) * time_to_expiry
+    ) / (sigma * math.sqrt(time_to_expiry))
+    return -math.exp(-dividend_yield * time_to_expiry) * norm_cdf(-d1)
+
+
+def nearest_expiration(ticker_obj, target_expiration):
+    try:
+        expirations = list(ticker_obj.options or [])
+    except Exception:
+        return None
+    if not expirations:
+        return None
+    if target_expiration in expirations:
+        return target_expiration
+    try:
+        target_ts = pd.Timestamp(target_expiration)
+        return sorted(expirations, key=lambda exp: abs((pd.Timestamp(exp) - target_ts).days))[0]
+    except Exception:
+        return expirations[0]
+
+
+def fetch_yf_iv_for_put(ticker, expiration, strike):
+    try:
+        ticker_obj = yf.Ticker(ticker)
+        matched_expiration = nearest_expiration(ticker_obj, expiration)
+        if not matched_expiration:
+            return float("nan")
+        chain = ticker_obj.option_chain(matched_expiration).puts.copy()
+        if chain.empty:
+            return float("nan")
+        chain["strike_diff"] = (chain["strike"].astype(float) - float(strike)).abs()
+        row = chain.sort_values("strike_diff").iloc[0]
+        return float(row.get("impliedVolatility", float("nan")))
+    except Exception:
+        return float("nan")
+
+
+def compute_put_delta(ticker, expiration, strike, stock_price, broker_delta):
+    if not pd.isna(broker_delta):
+        return broker_delta
+    iv = fetch_yf_iv_for_put(ticker, expiration, strike)
+    time_to_expiry = year_frac(expiration)
+    return bs_put_delta(stock_price, strike, time_to_expiry, rISK_FREE_RATE, iv, DIVIDEND_YIELD)
 
 
 def fetch_current_stock_prices(tickers):
@@ -80,6 +150,7 @@ def format_display_table(df_out):
             'Contracts Sold': 'Qty',
             'Strike Price': 'Strike',
             'Current Stock Price': 'Stock Px',
+            'Delta Numeric': 'Delta',
             'Moneyness Status': 'Status',
             'Current Mkt Value': 'Mkt Value',
             'Cash Secured ($)': 'Cash Sec',
@@ -91,6 +162,7 @@ def format_display_table(df_out):
 
 def find_uncovered_short_puts(df_puts, stock_prices):
     uncovered_rows = []
+    delta_cache = {}
 
     for (_, _), group in df_puts.groupby(['Ticker', 'Expiration']):
         longs = []
@@ -125,6 +197,21 @@ def find_uncovered_short_puts(df_puts, stock_prices):
                 uncovered['Contracts Sold'] = remaining_short
                 current_stock_price = stock_prices.get(str(short_row['Ticker']).strip().upper())
                 uncovered['Current Stock Price'] = current_stock_price
+                strike = float(short_row['Strike Price'])
+                expiration = short_row['Expiration']
+                delta_key = (str(short_row['Ticker']).strip().upper(), expiration, strike)
+                if current_stock_price is None:
+                    uncovered['Delta Numeric'] = pd.NA
+                else:
+                    if delta_key not in delta_cache:
+                        delta_cache[delta_key] = compute_put_delta(
+                            delta_key[0],
+                            expiration,
+                            strike,
+                            current_stock_price,
+                            short_row.get('Delta Numeric', pd.NA),
+                        )
+                    uncovered['Delta Numeric'] = delta_cache[delta_key]
                 if current_stock_price is None:
                     uncovered['Moneyness Status'] = ''
                 elif short_strike <= current_stock_price:
@@ -161,10 +248,14 @@ def main():
     df_options = active_option_positions(df)
     df_options['Ticker'] = df_options['Underlying']
     df_puts = df_options[df_options['Opt Type'] == 'P'].copy()
+    if 'Delta' in df_puts.columns:
+        df_puts['Delta Numeric'] = df_puts['Delta'].apply(clean_numeric)
+    else:
+        df_puts['Delta Numeric'] = pd.NA
     stock_prices = fetch_current_stock_prices(df_puts['Ticker'])
     df_naked_short_puts = find_uncovered_short_puts(df_puts, stock_prices)
 
-    output_cols = ['Ticker', 'Symbol', 'Contracts Sold', 'Strike Price', 'Current Stock Price', 'Moneyness Status', 'Current Mkt Value', 'Cash Secured ($)']
+    output_cols = ['Ticker', 'Symbol', 'Contracts Sold', 'Strike Price', 'Current Stock Price', 'Delta Numeric', 'Moneyness Status', 'Current Mkt Value', 'Cash Secured ($)']
     df_out = df_naked_short_puts[output_cols].copy()
 
     total_row = pd.DataFrame([
@@ -174,6 +265,7 @@ def main():
             'Contracts Sold': df_out['Contracts Sold'].sum(),
             'Strike Price': 0.0,
             'Current Stock Price': 0.0,
+            'Delta Numeric': 0.0,
             'Moneyness Status': '',
             'Current Mkt Value': df_out['Current Mkt Value'].sum(),
             'Cash Secured ($)': df_out['Cash Secured ($)'].sum(),
