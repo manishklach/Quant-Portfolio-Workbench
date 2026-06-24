@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import argparse
 import math
+import re
 from datetime import datetime, time, timedelta, timezone
 from pathlib import Path
 
@@ -94,6 +95,8 @@ def year_fraction_to_expiry(expiration_text: str) -> float:
 def fetch_quote_snapshot(ticker: str) -> dict[str, float | str | None]:
     if yf is None:
         raise RuntimeError("yfinance not installed. Run: pip install yfinance")
+    if not re.match(r"^[A-Z][A-Z0-9.\-]*$", ticker):
+        return {"regular": None, "previous_close": None, "post": None, "exchange": None}
 
     tk = yf.Ticker(ticker)
     info = {}
@@ -114,6 +117,12 @@ def fetch_quote_snapshot(ticker: str) -> dict[str, float | str | None]:
     if previous_close is None or pd.isna(previous_close):
         previous_close = fast.get("regularMarketPreviousClose")
     post = info.get("postMarketPrice")
+    if post is None or pd.isna(post):
+        post = fast.get("postMarketPrice")
+    if post is None or pd.isna(post):
+        post = info.get("preMarketPrice")
+    if post is None or pd.isna(post):
+        post = fast.get("preMarketPrice")
     exchange = info.get("exchange") or fast.get("exchange")
 
     return {
@@ -218,11 +227,12 @@ def build_after_hours_report(csv_path: Path) -> tuple[pd.DataFrame, pd.DataFrame
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="Estimate after-hours portfolio P/L from my_holdings.csv")
+    parser.add_argument("csv", nargs="?", help="Optional positional path to holdings CSV")
     parser.add_argument("--file", default=None, help="Path to holdings CSV (default: my_holdings.csv next to script)")
     parser.add_argument("--output", default=None, help="Optional CSV path for position-level output")
     args = parser.parse_args()
 
-    csv_path = default_csv_path(args.file, __file__)
+    csv_path = default_csv_path(args.file or args.csv, __file__)
     positions, by_ticker = build_after_hours_report(csv_path)
 
     total_market_value = positions["current_market_value"].sum()
