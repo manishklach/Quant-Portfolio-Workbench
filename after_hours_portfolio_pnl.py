@@ -52,6 +52,9 @@ DRAM_PROXY_MAP = {
     "WINBOND": "2344.TW",
     "GIGADEVICE": "603986.SS",
 }
+LEVERAGED_PROXY_MAP = {
+    "MUU": {"underlying": "MU", "leverage": 2.0, "label": "Direxion Daily MU Bull 2X ETF"},
+}
 
 
 def norm_cdf(x: float) -> float:
@@ -271,6 +274,45 @@ def build_dram_proxy_snapshot(perp_cache: dict[str, dict[str, float | str | None
     }
 
 
+def build_leveraged_proxy_snapshot(
+    ticker: str,
+    perp_cache: dict[str, dict[str, float | str | None]],
+    prefer_perp: bool,
+) -> dict[str, float | str | None]:
+    proxy_meta = LEVERAGED_PROXY_MAP.get(ticker)
+    if not proxy_meta:
+        return {}
+
+    underlying = str(proxy_meta["underlying"]).upper()
+    leverage = float(proxy_meta["leverage"])
+    quote = fetch_quote_snapshot(underlying)
+    perp_quote = perp_cache.get(underlying, {})
+    regular = quote.get("regular")
+    after_hours_price, after_hours_source = choose_after_hours_price(
+        underlying,
+        quote,
+        perp_quote,
+        prefer_perp=prefer_perp,
+    )
+    if regular is None or after_hours_price is None or regular == 0:
+        return {}
+
+    underlying_return = (after_hours_price - regular) / regular
+    leveraged_return = leverage * underlying_return
+    return {
+        "ticker": ticker,
+        "underlying": underlying,
+        "leverage": leverage,
+        "regular_underlying": regular,
+        "after_hours_underlying": after_hours_price,
+        "underlying_return": underlying_return,
+        "leveraged_return": leveraged_return,
+        "source": f"leveraged_proxy_{underlying}",
+        "underlying_source": after_hours_source,
+        "label": proxy_meta.get("label"),
+    }
+
+
 def fetch_coinbase_equity_perp_snapshots() -> dict[str, dict[str, float | str | None]]:
     if requests is None:
         return {}
@@ -345,6 +387,7 @@ def build_after_hours_report(csv_path: Path, prefer_perp: bool = False, prefer_e
     quote_cache: dict[str, dict[str, float | str | None]] = {}
     perp_cache = fetch_coinbase_equity_perp_snapshots()
     dram_proxy = build_dram_proxy_snapshot(perp_cache, prefer_perp)
+    leveraged_proxy_cache: dict[str, dict[str, float | str | None]] = {}
     position_rows: list[dict[str, object]] = []
 
     for _, row in holdings.iterrows():
@@ -373,6 +416,13 @@ def build_after_hours_report(csv_path: Path, prefer_perp: bool = False, prefer_e
             perp_quote,
             prefer_perp=prefer_perp,
         )
+        if ticker in LEVERAGED_PROXY_MAP and regular_price is not None:
+            if ticker not in leveraged_proxy_cache:
+                leveraged_proxy_cache[ticker] = build_leveraged_proxy_snapshot(ticker, perp_cache, prefer_perp)
+            leveraged_proxy = leveraged_proxy_cache.get(ticker, {})
+            if leveraged_proxy and (prefer_perp or after_hours_price is None):
+                after_hours_price = regular_price * (1.0 + float(leveraged_proxy["leveraged_return"]))
+                after_hours_source = str(leveraged_proxy["source"])
         if ticker == "DRAM" and regular_price is not None and dram_proxy:
             if prefer_etf_proxy or after_hours_price is None:
                 after_hours_price = regular_price * (1.0 + float(dram_proxy["weighted_return"]))
@@ -410,6 +460,8 @@ def build_after_hours_report(csv_path: Path, prefer_perp: bool = False, prefer_e
                 "perp_symbol": perp_quote.get("product_id"),
                 "perp_index_price": perp_quote.get("index_price"),
                 "perp_last_price": perp_quote.get("last_price"),
+                "leveraged_proxy_underlying": leveraged_proxy_cache.get(ticker, {}).get("underlying") if ticker in LEVERAGED_PROXY_MAP else None,
+                "leveraged_proxy_leverage": leveraged_proxy_cache.get(ticker, {}).get("leverage") if ticker in LEVERAGED_PROXY_MAP else None,
                 "etf_proxy_coverage_pct": float(dram_proxy["covered_weight"]) * 100.0 if ticker == "DRAM" and dram_proxy else None,
                 "current_market_value": market_value,
                 "estimated_ah_price": ah_mark,
