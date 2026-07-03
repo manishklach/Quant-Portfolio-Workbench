@@ -9,7 +9,7 @@ The current primary script in this repo is `final_portfolio_noise_checker_v2.py`
 Install dependencies:
 
 ```powershell
-python -m pip install pandas yfinance numpy openpyxl
+python -m pip install pandas yfinance numpy openpyxl requests
 ```
 
 Run the latest checker against a Schwab holdings CSV:
@@ -28,6 +28,24 @@ Optional: override rate and dividend assumptions for the Black-Scholes fallback:
 
 ```powershell
 python.exe .\final_portfolio_noise_checker_v2.py .\my_holdings.csv --risk-free-rate 0.04 --dividend-yield 0.01
+```
+
+Estimate after-hours portfolio P/L from a Schwab holdings export:
+
+```powershell
+python.exe .\after_hours_portfolio_pnl.py .\my_holdings.csv
+```
+
+Use Coinbase equity perpetuals as the preferred overnight price source for supported names such as `MU`, `BE`, `NVDA`, and `TSM`:
+
+```powershell
+python.exe .\after_hours_portfolio_pnl.py .\my_holdings.csv --prefer-perp
+```
+
+Force the `DRAM` ETF to use a component basket proxy when you want memory-stock overnight moves reflected through its holdings:
+
+```powershell
+python.exe .\after_hours_portfolio_pnl.py .\my_holdings.csv --prefer-etf-proxy
 ```
 
 ## What This Tool Is
@@ -83,7 +101,100 @@ Primary script:
 
 - `final_portfolio_noise_checker_v2.py`
 
+Additional utility:
+
+- `after_hours_portfolio_pnl.py`
+
 If other older scripts exist in the repo, treat this file as the intended final noise-checker version unless you are explicitly debugging an older workflow.
+
+## After-Hours Estimator
+
+`after_hours_portfolio_pnl.py` estimates after-hours or overnight mark changes for the holdings in a Schwab export.
+
+For stocks and ETFs:
+
+```text
+estimated_ah_pl =
+shares × (after_hours_price - regular_price)
+```
+
+For options, the script:
+
+- reads the regular-session option mark from the CSV
+- infers implied volatility from that mark
+- reprices the option using the updated after-hours underlying price
+- falls back to an intrinsic-change approximation if IV inference fails
+
+### Price Sources
+
+Default behavior:
+
+- use Yahoo `postMarketPrice` when available
+- otherwise use Yahoo `preMarketPrice`
+- otherwise fall back to Coinbase equity perpetual prices for supported names
+
+Perpetual-futures support:
+
+- `--list-perps` prints which held tickers currently have Coinbase equity perpetuals
+- `--prefer-perp` makes the script prefer the Coinbase perpetual price even if Yahoo post-market data exists
+
+Current supported held names are determined live from Coinbase's public equity perpetual feed and, when last checked, included names such as:
+
+- `AAPL`
+- `BE`
+- `INTC`
+- `META`
+- `MSFT`
+- `MU`
+- `NVDA`
+- `SNDK`
+- `TSLA`
+- `TSM`
+
+For perpetual pricing, the script prefers:
+
+1. Coinbase perpetual `index_price`
+2. Coinbase perpetual last `price`
+3. Coinbase perpetual `mid_market_price`
+
+This keeps the overnight proxy closer to the underlying reference than to a noisy single trade.
+
+### DRAM ETF Proxy
+
+`DRAM` can also be estimated from its memory-stock basket when you want moves in names such as `MU`, `SNDK`, `SK Hynix`, `Samsung`, or `Kioxia` to flow through the ETF estimate.
+
+Use:
+
+```powershell
+python.exe .\after_hours_portfolio_pnl.py .\my_holdings.csv --prefer-etf-proxy
+```
+
+Or combine it with perpetual pricing:
+
+```powershell
+python.exe .\after_hours_portfolio_pnl.py .\my_holdings.csv --prefer-perp --prefer-etf-proxy
+```
+
+Notes:
+
+- by default, if `DRAM` itself has a real Yahoo after-hours quote, the script uses that direct quote
+- `--prefer-etf-proxy` overrides that and uses the basket-based estimate instead
+- the proxy may be partial if not every component has a usable live quote, so the output includes `etf_proxy_coverage_pct`
+
+### Output Columns
+
+The position-level CSV produced by `after_hours_portfolio_pnl.py --output ...` includes fields such as:
+
+- `regular_underlying`
+- `after_hours_underlying`
+- `after_hours_source`
+- `perp_symbol`
+- `perp_index_price`
+- `perp_last_price`
+- `etf_proxy_coverage_pct`
+- `estimated_ah_price`
+- `estimated_ah_pl`
+- `pricing_method`
 
 ## Methodology
 
@@ -447,4 +558,3 @@ Before sharing the repo or code:
 1. Remove `my_holdings.csv`.
 2. Remove generated `.csv`, `.xls`, and `.xlsx` files.
 3. Share only code and docs, not account data.
-

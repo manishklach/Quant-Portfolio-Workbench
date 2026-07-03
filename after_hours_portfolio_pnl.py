@@ -15,10 +15,16 @@ from __future__ import annotations
 import argparse
 import math
 import re
+from io import StringIO
 from datetime import datetime, time, timedelta, timezone
 from pathlib import Path
 
 import pandas as pd
+
+try:
+    import requests
+except ImportError:
+    requests = None
 
 try:
     import yfinance as yf
@@ -32,6 +38,20 @@ RISK_FREE_RATE = 0.045
 DIVIDEND_YIELD = 0.0
 UTC = timezone.utc
 EASTERN_OFFSET = timezone(timedelta(hours=-4))
+COINBASE_PRODUCTS_URL = "https://api.coinbase.com/api/v3/brokerage/market/products"
+DRAM_HOLDINGS_URL = "https://stockanalysis.com/etf/dram/holdings/"
+DRAM_PROXY_MAP = {
+    "MICRON": "MU",
+    "SANDISK": "SNDK",
+    "SK HYNIX": "000660.KS",
+    "SAMSUNG ELECTRONICS": "005930.KS",
+    "KIOXIA": "285A.T",
+    "SEAGATE": "STX",
+    "WESTERN DIGITAL": "WDC",
+    "NANYA": "2408.TW",
+    "WINBOND": "2344.TW",
+    "GIGADEVICE": "603986.SS",
+}
 
 
 def norm_cdf(x: float) -> float:
@@ -92,10 +112,14 @@ def year_fraction_to_expiry(expiration_text: str) -> float:
     return max((expiry_dt - now_dt).total_seconds() / (365.0 * 24.0 * 3600.0), 1.0 / 365.0)
 
 
-def fetch_quote_snapshot(ticker: str) -> dict[str, float | str | None]:
+def fetch_quote_snapshot(ticker: str, *, allow_numeric_symbol: bool = False) -> dict[str, float | str | None]:
     if yf is None:
         raise RuntimeError("yfinance not installed. Run: pip install yfinance")
-    if not re.match(r"^[A-Z][A-Z0-9.\-]*$", ticker):
+    if allow_numeric_symbol:
+        is_valid = bool(re.match(r"^[A-Z0-9.\-]+$", ticker))
+    else:
+        is_valid = bool(re.match(r"^[A-Z][A-Z0-9.\-]*$", ticker))
+    if not is_valid:
         return {"regular": None, "previous_close": None, "post": None, "exchange": None}
 
     tk = yf.Ticker(ticker)
@@ -117,20 +141,184 @@ def fetch_quote_snapshot(ticker: str) -> dict[str, float | str | None]:
     if previous_close is None or pd.isna(previous_close):
         previous_close = fast.get("regularMarketPreviousClose")
     post = info.get("postMarketPrice")
+    post_source = "yahoo_post"
     if post is None or pd.isna(post):
         post = fast.get("postMarketPrice")
+        post_source = "yahoo_post"
     if post is None or pd.isna(post):
         post = info.get("preMarketPrice")
+        post_source = "yahoo_pre"
     if post is None or pd.isna(post):
         post = fast.get("preMarketPrice")
+        post_source = "yahoo_pre"
+    if post is None or pd.isna(post):
+        post_source = None
     exchange = info.get("exchange") or fast.get("exchange")
 
     return {
         "regular": float(regular) if regular is not None and not pd.isna(regular) else None,
         "previous_close": float(previous_close) if previous_close is not None and not pd.isna(previous_close) else None,
         "post": float(post) if post is not None and not pd.isna(post) else None,
+        "post_source": post_source,
         "exchange": exchange,
     }
+
+
+def choose_after_hours_price(
+    ticker: str,
+    quote: dict[str, float | str | None],
+    perp_quote: dict[str, float | str | None],
+    *,
+    prefer_perp: bool = False,
+) -> tuple[float | None, str | None]:
+    if prefer_perp and perp_quote.get("synthetic_price") is not None:
+        return perp_quote["synthetic_price"], perp_quote.get("price_source")
+
+    after_hours_price = quote.get("post")
+    after_hours_source = quote.get("post_source")
+    if after_hours_price is None and perp_quote.get("synthetic_price") is not None:
+        return perp_quote["synthetic_price"], perp_quote.get("price_source")
+    return after_hours_price, after_hours_source
+
+
+def fetch_dram_holdings() -> pd.DataFrame:
+    if requests is None:
+        return pd.DataFrame()
+    try:
+        html = requests.get(DRAM_HOLDINGS_URL, timeout=20, headers={"User-Agent": "Mozilla/5.0"}).text
+        tables = pd.read_html(StringIO(html))
+    except Exception:
+        return pd.DataFrame()
+
+    if not tables:
+        return pd.DataFrame()
+    holdings = tables[0].copy()
+    expected = {"Symbol", "Name", "% Weight"}
+    if not expected.issubset(set(holdings.columns)):
+        return pd.DataFrame()
+
+    holdings["weight_pct"] = pd.to_numeric(
+        holdings["% Weight"].astype(str).str.replace("%", "", regex=False),
+        errors="coerce",
+    )
+    holdings["name_upper"] = holdings["Name"].astype(str).str.upper()
+    return holdings
+
+
+def map_dram_component_ticker(symbol: str, name: str) -> str | None:
+    symbol_text = str(symbol).strip().upper()
+    name_text = str(name).strip().upper()
+
+    if symbol_text in {"MU", "SNDK", "STX", "WDC"}:
+        return symbol_text
+
+    for key, proxy in DRAM_PROXY_MAP.items():
+        if key in name_text:
+            return proxy
+    return None
+
+
+def build_dram_proxy_snapshot(perp_cache: dict[str, dict[str, float | str | None]], prefer_perp: bool) -> dict[str, float | str | None]:
+    holdings = fetch_dram_holdings()
+    if holdings.empty:
+        return {}
+
+    rows: list[dict[str, object]] = []
+    weighted_return = 0.0
+    covered_weight = 0.0
+
+    for _, row in holdings.iterrows():
+        proxy_ticker = map_dram_component_ticker(row.get("Symbol"), row.get("Name"))
+        weight_pct = pd.to_numeric(row.get("weight_pct"), errors="coerce")
+        if proxy_ticker is None or pd.isna(weight_pct) or weight_pct <= 0:
+            continue
+
+        quote = fetch_quote_snapshot(proxy_ticker, allow_numeric_symbol=("." in proxy_ticker and proxy_ticker[0].isdigit()))
+        perp_quote = perp_cache.get(proxy_ticker, {})
+        regular = quote.get("regular")
+        after_hours_price, after_hours_source = choose_after_hours_price(
+            proxy_ticker,
+            quote,
+            perp_quote,
+            prefer_perp=prefer_perp,
+        )
+        if regular is None or after_hours_price is None or regular == 0:
+            continue
+
+        component_return = (after_hours_price - regular) / regular
+        weight_frac = float(weight_pct) / 100.0
+        weighted_return += weight_frac * component_return
+        covered_weight += weight_frac
+        rows.append(
+            {
+                "component": proxy_ticker,
+                "weight_pct": float(weight_pct),
+                "regular": regular,
+                "after_hours": after_hours_price,
+                "after_hours_source": after_hours_source,
+                "component_return_pct": component_return * 100.0,
+            }
+        )
+
+    if not rows:
+        return {}
+
+    return {
+        "weighted_return": weighted_return,
+        "covered_weight": covered_weight,
+        "components_used": rows,
+        "source": "dram_holdings_proxy_partial",
+    }
+
+
+def fetch_coinbase_equity_perp_snapshots() -> dict[str, dict[str, float | str | None]]:
+    if requests is None:
+        return {}
+
+    params = {
+        "product_type": "FUTURE",
+        "contract_expiry_type": "PERPETUAL",
+        "futures_underlying_type": "FUTURES_UNDERLYING_TYPE_EQUITY",
+        "limit": 500,
+    }
+    try:
+        response = requests.get(COINBASE_PRODUCTS_URL, params=params, timeout=20)
+        response.raise_for_status()
+        products = response.json().get("products", [])
+    except Exception:
+        return {}
+
+    out: dict[str, dict[str, float | str | None]] = {}
+    for product in products:
+        details = product.get("future_product_details") or {}
+        ticker = (details.get("contract_code") or "").strip().upper()
+        if not ticker:
+            continue
+
+        index_price = pd.to_numeric(details.get("index_price"), errors="coerce")
+        last_price = pd.to_numeric(product.get("price"), errors="coerce")
+        mid_price = pd.to_numeric(product.get("mid_market_price"), errors="coerce")
+
+        synthetic_price = index_price
+        price_source = "coinbase_perp_index"
+        if pd.isna(synthetic_price):
+            synthetic_price = last_price
+            price_source = "coinbase_perp_last"
+        if pd.isna(synthetic_price):
+            synthetic_price = mid_price
+            price_source = "coinbase_perp_mid"
+
+        out[ticker] = {
+            "ticker": ticker,
+            "product_id": product.get("product_id"),
+            "display_name": product.get("display_name"),
+            "synthetic_price": float(synthetic_price) if not pd.isna(synthetic_price) else None,
+            "index_price": float(index_price) if not pd.isna(index_price) else None,
+            "last_price": float(last_price) if not pd.isna(last_price) else None,
+            "mid_price": float(mid_price) if not pd.isna(mid_price) else None,
+            "price_source": price_source if not pd.isna(synthetic_price) else None,
+        }
+    return out
 
 
 def estimate_option_after_hours_price(row: pd.Series, underlying_regular: float, underlying_post: float) -> tuple[float, str]:
@@ -152,9 +340,11 @@ def estimate_option_after_hours_price(row: pd.Series, underlying_regular: float,
     return fallback_price, "intrinsic_fallback"
 
 
-def build_after_hours_report(csv_path: Path) -> tuple[pd.DataFrame, pd.DataFrame]:
+def build_after_hours_report(csv_path: Path, prefer_perp: bool = False, prefer_etf_proxy: bool = False) -> tuple[pd.DataFrame, pd.DataFrame]:
     holdings = load_schwab_holdings(csv_path)
     quote_cache: dict[str, dict[str, float | str | None]] = {}
+    perp_cache = fetch_coinbase_equity_perp_snapshots()
+    dram_proxy = build_dram_proxy_snapshot(perp_cache, prefer_perp)
     position_rows: list[dict[str, object]] = []
 
     for _, row in holdings.iterrows():
@@ -169,6 +359,7 @@ def build_after_hours_report(csv_path: Path) -> tuple[pd.DataFrame, pd.DataFrame
             except Exception:
                 quote_cache[ticker] = {"regular": None, "previous_close": None, "post": None, "exchange": None}
         quote = quote_cache[ticker]
+        perp_quote = perp_cache.get(ticker, {})
 
         asset_type = str(row.get("Asset Type Normalized", "")).strip()
         is_option = bool(row.get("Is Option"))
@@ -176,7 +367,16 @@ def build_after_hours_report(csv_path: Path) -> tuple[pd.DataFrame, pd.DataFrame
         multiplier = 100.0 if is_option else 1.0
 
         regular_price = quote["regular"]
-        after_hours_price = quote["post"]
+        after_hours_price, after_hours_source = choose_after_hours_price(
+            ticker,
+            quote,
+            perp_quote,
+            prefer_perp=prefer_perp,
+        )
+        if ticker == "DRAM" and regular_price is not None and dram_proxy:
+            if prefer_etf_proxy or after_hours_price is None:
+                after_hours_price = regular_price * (1.0 + float(dram_proxy["weighted_return"]))
+                after_hours_source = str(dram_proxy["source"])
         pricing_method = "unchanged"
 
         if is_option:
@@ -206,6 +406,11 @@ def build_after_hours_report(csv_path: Path) -> tuple[pd.DataFrame, pd.DataFrame
                 "qty": qty,
                 "regular_underlying": regular_price,
                 "after_hours_underlying": after_hours_price,
+                "after_hours_source": after_hours_source,
+                "perp_symbol": perp_quote.get("product_id"),
+                "perp_index_price": perp_quote.get("index_price"),
+                "perp_last_price": perp_quote.get("last_price"),
+                "etf_proxy_coverage_pct": float(dram_proxy["covered_weight"]) * 100.0 if ticker == "DRAM" and dram_proxy else None,
                 "current_market_value": market_value,
                 "estimated_ah_price": ah_mark,
                 "estimated_ah_pl": ah_pl,
@@ -230,10 +435,41 @@ def main() -> int:
     parser.add_argument("csv", nargs="?", help="Optional positional path to holdings CSV")
     parser.add_argument("--file", default=None, help="Path to holdings CSV (default: my_holdings.csv next to script)")
     parser.add_argument("--output", default=None, help="Optional CSV path for position-level output")
+    parser.add_argument("--list-perps", action="store_true", help="Print held tickers that have Coinbase equity perpetuals")
+    parser.add_argument("--prefer-perp", action="store_true", help="Prefer Coinbase equity perpetual prices over Yahoo post/pre-market when available")
+    parser.add_argument("--prefer-etf-proxy", action="store_true", help="Prefer ETF basket proxy pricing for supported ETFs like DRAM")
     args = parser.parse_args()
 
     csv_path = default_csv_path(args.file or args.csv, __file__)
-    positions, by_ticker = build_after_hours_report(csv_path)
+    if args.list_perps:
+        holdings = load_schwab_holdings(csv_path)
+        held = sorted(set(holdings["Underlying"].dropna().astype(str).str.upper()))
+        perps = fetch_coinbase_equity_perp_snapshots()
+        rows = []
+        for ticker in held:
+            perp = perps.get(ticker)
+            if not perp:
+                continue
+            rows.append(
+                {
+                    "ticker": ticker,
+                    "perp_symbol": perp.get("product_id"),
+                    "price_source": perp.get("price_source"),
+                    "perp_price_used": perp.get("synthetic_price"),
+                }
+            )
+        out = pd.DataFrame(rows)
+        if out.empty:
+            print("No held tickers currently match Coinbase equity perpetuals.")
+        else:
+            print(out.sort_values("ticker").to_string(index=False))
+        return 0
+
+    positions, by_ticker = build_after_hours_report(
+        csv_path,
+        prefer_perp=args.prefer_perp,
+        prefer_etf_proxy=args.prefer_etf_proxy,
+    )
 
     total_market_value = positions["current_market_value"].sum()
     total_ah_pl = positions["estimated_ah_pl"].sum()
