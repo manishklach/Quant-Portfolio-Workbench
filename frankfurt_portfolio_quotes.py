@@ -210,73 +210,111 @@ def fetch_quote_snapshot(symbol: str) -> dict[str, float | str | None]:
     }
 
 
-def build_report(csv_path: Path, *, allow_xetra: bool = False, ticker_filter: str | None = None) -> pd.DataFrame:
+def fetch_fx_rate_to_usd(currency: str) -> float | None:
+    currency = str(currency or "").strip().upper()
+    if not currency:
+        return None
+    if currency == "USD":
+        return 1.0
+    if yf is None:
+        raise RuntimeError("yfinance not installed. Run: pip install yfinance")
+
+    pair = f"{currency}USD=X"
+    quote = fetch_quote_snapshot(pair)
+    rate = quote.get("regular")
+    return float(rate) if rate is not None and not pd.isna(rate) else None
+
+
+def build_report(
+    csv_path: Path,
+    *,
+    allow_xetra: bool = False,
+    ticker_filter: str | None = None,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
     holdings = load_schwab_holdings(csv_path)
     tickers = sorted(set(holdings["Underlying"].dropna().astype(str).str.upper()))
     if ticker_filter:
         wanted = {item.strip().upper() for item in ticker_filter.split(",") if item.strip()}
         tickers = [ticker for ticker in tickers if ticker in wanted]
 
+    direct_positions = (
+        holdings[~holdings["Is Option"]]
+        .groupby("Underlying", as_index=False)
+        .agg(
+            qty=("Qty", "sum"),
+            current_market_value=("Market Value Numeric", "sum"),
+        )
+        .rename(columns={"Underlying": "ticker"})
+    )
+    direct_positions["ticker"] = direct_positions["ticker"].astype(str).str.upper()
+    if ticker_filter:
+        direct_positions = direct_positions[direct_positions["ticker"].isin(wanted)].copy()
+
     rows: list[dict[str, object]] = []
+    fx_cache: dict[str, float | None] = {}
     for base_ticker in tickers:
         if not is_probable_security_ticker(base_ticker):
-            rows.append(
-                {
-                    "ticker": base_ticker,
-                    "status": "skipped_non_equity_symbol",
-                }
-            )
             continue
 
         try:
             listing = find_frankfurt_listing(base_ticker, allow_xetra=allow_xetra)
         except Exception as exc:
-            rows.append({"ticker": base_ticker, "status": "search_error", "note": str(exc)})
             continue
 
         if not listing:
-            rows.append({"ticker": base_ticker, "status": "no_frankfurt_match"})
             continue
 
         yahoo_symbol = str(listing.get("symbol") or "")
         try:
             quote = fetch_quote_snapshot(yahoo_symbol)
         except Exception as exc:
-            rows.append(
-                {
-                    "ticker": base_ticker,
-                    "status": "quote_error",
-                    "frankfurt_symbol": yahoo_symbol,
-                    "frankfurt_exchange": listing.get("exchDisp") or listing.get("exchange"),
-                    "note": str(exc),
-                }
-            )
             continue
 
         regular = quote.get("regular")
         previous_close = quote.get("previous_close")
-        change = None
-        if regular is not None and previous_close is not None:
-            change = regular - previous_close
+        if regular is None or pd.isna(regular):
+            continue
+
+        change = regular - previous_close if previous_close is not None and not pd.isna(previous_close) else None
+        currency = str(quote.get("currency") or "").upper()
+        if currency not in fx_cache:
+            try:
+                fx_cache[currency] = fetch_fx_rate_to_usd(currency)
+            except Exception:
+                fx_cache[currency] = None
+        usd_fx = fx_cache.get(currency)
+        price_usd = regular * usd_fx if usd_fx is not None else None
+        previous_close_usd = previous_close * usd_fx if previous_close is not None and usd_fx is not None else None
+        change_usd = change * usd_fx if change is not None and usd_fx is not None else None
 
         rows.append(
             {
                 "ticker": base_ticker,
-                "status": "ok",
                 "matched_name": listing.get("longname") or listing.get("shortname"),
                 "frankfurt_symbol": yahoo_symbol,
                 "frankfurt_exchange": listing.get("exchDisp") or listing.get("exchange"),
                 "quote_exchange": quote.get("exchange"),
-                "currency": quote.get("currency"),
+                "currency": currency,
                 "price": regular,
                 "previous_close": previous_close,
                 "change": change,
+                "usd_fx": usd_fx,
+                "price_usd": price_usd,
+                "previous_close_usd": previous_close_usd,
+                "change_usd": change_usd,
                 "matched_query": listing.get("_matched_query"),
                 "base_name": listing.get("_base_name"),
             }
         )
 
-    return pd.DataFrame(rows)
+    report = pd.DataFrame(rows)
+    if report.empty:
+        return report, pd.DataFrame()
+
+    portfolio = direct_positions.merge(report, on="ticker", how="inner")
+    if not portfolio.empty:
+        portfolio["approx_position_change_usd"] = portfolio["qty"] * portfolio["change_usd"]
+    return report, portfolio
 
 
 def main() -> int:
@@ -289,7 +327,7 @@ def main() -> int:
     args = parser.parse_args()
 
     csv_path = default_csv_path(args.file or args.csv, __file__)
-    report = build_report(csv_path, allow_xetra=args.allow_xetra, ticker_filter=args.ticker)
+    report, portfolio = build_report(csv_path, allow_xetra=args.allow_xetra, ticker_filter=args.ticker)
 
     if report.empty:
         print("No rows returned.")
@@ -299,18 +337,38 @@ def main() -> int:
         col
         for col in [
             "ticker",
-            "status",
             "frankfurt_symbol",
             "frankfurt_exchange",
             "currency",
             "price",
             "previous_close",
             "change",
+            "price_usd",
+            "previous_close_usd",
+            "change_usd",
             "matched_name",
         ]
         if col in report.columns
     ]
     print(report[display_columns].to_string(index=False))
+
+    if not portfolio.empty:
+        total_change = float(portfolio["approx_position_change_usd"].sum())
+        print("\nApprox Portfolio Change From Frankfurt Quotes")
+        print(
+            portfolio[
+                [
+                    "ticker",
+                    "qty",
+                    "change_usd",
+                    "approx_position_change_usd",
+                ]
+            ]
+            .sort_values("approx_position_change_usd", ascending=False)
+            .to_string(index=False)
+        )
+        print(f"\nApprox direct stock/ETF change: ${total_change:,.2f}")
+        print("Note: this Frankfurt portfolio total includes direct stock/ETF holdings only, not options.")
 
     if args.output:
         output_path = Path(args.output)
