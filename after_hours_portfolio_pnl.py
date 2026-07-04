@@ -591,6 +591,12 @@ def main() -> int:
         held = sorted(set(holdings["Underlying"].dropna().astype(str).str.upper()))
         coinbase_perps = fetch_coinbase_equity_perp_snapshots()
         hyperliquid_caches: dict[str, dict[str, dict[str, float | str | None]]] = {}
+        quote_cache: dict[str, dict[str, float | str | None]] = {}
+        proxy_underlyings = {
+            str(meta.get("underlying") or "").strip().upper()
+            for meta in LEVERAGED_PROXY_MAP.values()
+            if str(meta.get("underlying") or "").strip()
+        }
         rows = []
         for ticker in held:
             perp = coinbase_perps.get(ticker)
@@ -624,6 +630,62 @@ def main() -> int:
                             "perp_price_used": perp.get("synthetic_price"),
                         }
                     )
+                    continue
+
+            if ticker in proxy_underlyings:
+                if ticker not in quote_cache:
+                    try:
+                        quote_cache[ticker] = fetch_quote_snapshot(ticker)
+                    except Exception:
+                        quote_cache[ticker] = {"regular": None, "previous_close": None, "post": None, "exchange": None}
+
+                anchor_quote = quote_cache.get(ticker, {})
+                anchor_after_hours_price, anchor_price_source = choose_after_hours_price(
+                    ticker,
+                    anchor_quote,
+                    coinbase_perps.get(ticker, {}),
+                    prefer_perp=True,
+                )
+                if anchor_after_hours_price is not None:
+                    rows.append(
+                        {
+                            "ticker": ticker,
+                            "perp_source": "proxy_anchor",
+                            "perp_symbol": ticker,
+                            "price_source": anchor_price_source or "after_hours_quote",
+                            "perp_price_used": anchor_after_hours_price,
+                        }
+                    )
+                    continue
+
+            proxy_meta = LEVERAGED_PROXY_MAP.get(ticker)
+            if proxy_meta:
+                underlying = str(proxy_meta.get("underlying") or "").strip().upper()
+                if underlying:
+                    if underlying not in quote_cache:
+                        try:
+                            quote_cache[underlying] = fetch_quote_snapshot(underlying)
+                        except Exception:
+                            quote_cache[underlying] = {"regular": None, "previous_close": None, "post": None, "exchange": None}
+
+                    underlying_quote = quote_cache.get(underlying, {})
+                    underlying_perp = coinbase_perps.get(underlying, {})
+                    proxy_after_hours_price, proxy_price_source = choose_after_hours_price(
+                        underlying,
+                        underlying_quote,
+                        underlying_perp,
+                        prefer_perp=True,
+                    )
+                    if proxy_after_hours_price is not None:
+                        rows.append(
+                            {
+                                "ticker": ticker,
+                                "perp_source": "proxy",
+                                "perp_symbol": underlying,
+                                "price_source": proxy_price_source or f"proxy_{underlying}",
+                                "perp_price_used": proxy_after_hours_price,
+                            }
+                        )
         out = pd.DataFrame(rows)
         if out.empty:
             print("No held tickers currently match the supported perp-based pricing sources.")
