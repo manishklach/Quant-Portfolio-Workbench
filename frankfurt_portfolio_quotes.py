@@ -352,9 +352,9 @@ def main() -> int:
     ]
     print(report[display_columns].to_string(index=False))
 
+    print("\nApprox Portfolio Change From Frankfurt Quotes")
     if not portfolio.empty:
         total_change = float(portfolio["approx_position_change_usd"].sum())
-        print("\nApprox Portfolio Change From Frankfurt Quotes")
         print(
             portfolio[
                 [
@@ -368,7 +368,10 @@ def main() -> int:
             .to_string(index=False)
         )
         print(f"\nApprox direct stock/ETF change: ${total_change:,.2f}")
-        print("Note: this Frankfurt portfolio total includes direct stock/ETF holdings only, not options.")
+    else:
+        print("No overlapping direct stock/ETF holdings were found among the Frankfurt-quoted tickers.")
+        print("Approx direct stock/ETF change: $0.00")
+    print("Note: this Frankfurt portfolio total includes direct stock/ETF holdings only, not options.")
 
     if args.output:
         output_path = Path(args.output)

@@ -1,6 +1,6 @@
-# Schwab Portfolio Utilities
+# Quant Portfolio Workbench
 
-Local Python utilities for analyzing a Schwab portfolio export on your own machine.
+Local Python utilities for analyzing a Schwab portfolio export on your own machine. The current workflows in this repo have been tested against a Schwab portfolio CSV export format.
 
 The current primary script in this repo is `final_portfolio_noise_checker_v2.py`. It is a mark-noise and sanity-check tool, not an official P/L calculator, accounting system, or tax report. Its purpose is to help reconcile Schwab's displayed option day P/L against simpler economic checks for a narrow set of call spreads and short puts.
 
@@ -46,6 +46,12 @@ Force the `DRAM` ETF to use a component basket proxy when you want memory-stock 
 
 ```powershell
 python.exe .\after_hours_portfolio_pnl.py .\my_holdings.csv --prefer-etf-proxy
+```
+
+List currently supported perp-driven price sources for the tickers in your holdings:
+
+```powershell
+python.exe .\after_hours_portfolio_pnl.py .\my_holdings.csv --list-perps
 ```
 
 ## What This Tool Is
@@ -135,10 +141,10 @@ Default behavior:
 
 Perpetual-futures support:
 
-- `--list-perps` prints which held tickers currently have Coinbase equity perpetuals
-- `--prefer-perp` makes the script prefer the Coinbase perpetual price even if Yahoo post-market data exists
+- `--list-perps` prints which held tickers currently have supported perp-based pricing sources
+- `--prefer-perp` makes the script prefer the supported perpetual price even if Yahoo post-market data exists
 
-Current supported held names are determined live from Coinbase's public equity perpetual feed and, when last checked, included names such as:
+Current supported held names are determined live from Coinbase's public equity perpetual feed and Hyperliquid direct perp overrides and, when last checked, included names such as:
 
 - `AAPL`
 - `BE`
@@ -151,6 +157,10 @@ Current supported held names are determined live from Coinbase's public equity p
 - `TSLA`
 - `TSM`
 
+Direct perp overrides currently include:
+
+- `DRAM` via Hyperliquid `xyz`
+
 For perpetual pricing, the script prefers:
 
 1. Coinbase perpetual `index_price`
@@ -158,6 +168,17 @@ For perpetual pricing, the script prefers:
 3. Coinbase perpetual `mid_market_price`
 
 This keeps the overnight proxy closer to the underlying reference than to a noisy single trade.
+
+### QQQ-Based ETF Proxies
+
+When you use `--prefer-perp`, certain income or proxy ETFs can inherit `QQQ`'s overnight move when they do not have a better direct after-hours signal.
+
+Current `QQQ`-linked proxy coverage includes:
+
+- `QQQI`
+- `XQQI`
+
+These are treated as approximate `1.0x` `QQQ` move proxies for overnight estimation, so they are useful for a fast portfolio read but should not be treated as an official NAV calculation.
 
 ### DRAM ETF Proxy
 

@@ -64,6 +64,8 @@ DRAM_PROXY_MAP = {
 }
 LEVERAGED_PROXY_MAP = {
     "MUU": {"underlying": "MU", "leverage": 2.0, "label": "Direxion Daily MU Bull 2X ETF"},
+    "QQQI": {"underlying": "QQQ", "leverage": 1.0, "label": "QQQ Income ETF proxy"},
+    "XQQI": {"underlying": "QQQ", "leverage": 1.0, "label": "QQQ Income ETF proxy"},
 }
 
 
@@ -578,7 +580,7 @@ def main() -> int:
     parser.add_argument("csv", nargs="?", help="Optional positional path to holdings CSV")
     parser.add_argument("--file", default=None, help="Path to holdings CSV (default: my_holdings.csv next to script)")
     parser.add_argument("--output", default=None, help="Optional CSV path for position-level output")
-    parser.add_argument("--list-perps", action="store_true", help="Print held tickers that have Coinbase equity perpetuals")
+    parser.add_argument("--list-perps", action="store_true", help="Print held tickers that have supported perp-based pricing sources")
     parser.add_argument("--prefer-perp", action="store_true", help="Prefer Coinbase equity perpetual prices over Yahoo post/pre-market when available")
     parser.add_argument("--prefer-etf-proxy", action="store_true", help="Prefer ETF basket proxy pricing for supported ETFs like DRAM")
     args = parser.parse_args()
@@ -587,23 +589,44 @@ def main() -> int:
     if args.list_perps:
         holdings = load_schwab_holdings(csv_path)
         held = sorted(set(holdings["Underlying"].dropna().astype(str).str.upper()))
-        perps = fetch_coinbase_equity_perp_snapshots()
+        coinbase_perps = fetch_coinbase_equity_perp_snapshots()
+        hyperliquid_caches: dict[str, dict[str, dict[str, float | str | None]]] = {}
         rows = []
         for ticker in held:
-            perp = perps.get(ticker)
-            if not perp:
+            perp = coinbase_perps.get(ticker)
+            if perp:
+                rows.append(
+                    {
+                        "ticker": ticker,
+                        "perp_source": "coinbase",
+                        "perp_symbol": perp.get("product_id"),
+                        "price_source": perp.get("price_source"),
+                        "perp_price_used": perp.get("synthetic_price"),
+                    }
+                )
                 continue
-            rows.append(
-                {
-                    "ticker": ticker,
-                    "perp_symbol": perp.get("product_id"),
-                    "price_source": perp.get("price_source"),
-                    "perp_price_used": perp.get("synthetic_price"),
-                }
-            )
+
+            direct_cfg = DIRECT_PERP_CONFIG.get(ticker, {})
+            if str(direct_cfg.get("source") or "").strip().lower() == "hyperliquid":
+                dex = str(direct_cfg.get("dex") or "").strip().lower()
+                symbol = str(direct_cfg.get("symbol") or ticker).strip().upper()
+                if dex and dex not in hyperliquid_caches:
+                    hyperliquid_caches[dex] = fetch_hyperliquid_perp_snapshots(dex=dex)
+                cache_key = f"{dex}:{symbol}".upper() if dex else symbol
+                perp = hyperliquid_caches.get(dex, {}).get(cache_key)
+                if perp:
+                    rows.append(
+                        {
+                            "ticker": ticker,
+                            "perp_source": "hyperliquid",
+                            "perp_symbol": cache_key,
+                            "price_source": perp.get("price_source"),
+                            "perp_price_used": perp.get("synthetic_price"),
+                        }
+                    )
         out = pd.DataFrame(rows)
         if out.empty:
-            print("No held tickers currently match Coinbase equity perpetuals.")
+            print("No held tickers currently match the supported perp-based pricing sources.")
         else:
             print(out.sort_values("ticker").to_string(index=False))
         return 0
