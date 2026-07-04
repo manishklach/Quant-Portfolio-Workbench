@@ -54,6 +54,18 @@ List currently supported perp-driven price sources for the tickers in your holdi
 python.exe .\after_hours_portfolio_pnl.py .\my_holdings.csv --list-perps
 ```
 
+Run the Nasdaq-100 quant model scanner:
+
+```powershell
+python.exe .\nasdaq100_quant_model.py scan --top 12 --csv .\my_holdings.csv
+```
+
+Run the Nasdaq-100 quant model backtest:
+
+```powershell
+python.exe .\nasdaq100_quant_model.py backtest --years 5 --top 12
+```
+
 ## What This Tool Is
 
 `final_portfolio_noise_checker_v2.py` looks for two specific situations:
@@ -110,6 +122,7 @@ Primary script:
 Additional utility:
 
 - `after_hours_portfolio_pnl.py`
+- `nasdaq100_quant_model.py`
 
 If other older scripts exist in the repo, treat this file as the intended final noise-checker version unless you are explicitly debugging an older workflow.
 
@@ -216,6 +229,74 @@ The position-level CSV produced by `after_hours_portfolio_pnl.py --output ...` i
 - `estimated_ah_price`
 - `estimated_ah_pl`
 - `pricing_method`
+
+## Nasdaq-100 Quant Model
+
+`nasdaq100_quant_model.py` is a practical hybrid model for ranking current Nasdaq-100 names and producing buy / hold / sell / reduce flags.
+
+It has three modes:
+
+- `universe`: fetch the current public Nasdaq-100 constituent list from Nasdaq
+- `scan`: score the current universe and optionally tag names from a Schwab holdings CSV
+- `backtest`: run a simple weekly-rebalance historical test on the same score
+
+### Model Structure
+
+The live scanner combines technical and fundamental buckets:
+
+- `trend_score`: `8EMA`, `21EMA`, `50MA`, `200MA`, and price-vs-average structure
+- `rs_score`: 1-month, 3-month, and 6-month relative-strength ranking across the Nasdaq-100
+- `confirm_score`: `MACD` histogram, `RSI`, and Bollinger-band context
+- `penalty_score`: overextension penalties for very high `RSI`, stretched price-vs-ATR, and extreme Bollinger extension
+- `fundamental_score`: growth, quality, and valuation signals from live `yfinance` fundamentals
+- `risk_quality_score`: margin quality plus debt-discipline overlay
+
+The final score is:
+
+```text
+technical_score =
+0.35 * trend_score
++ 0.30 * rs_score
++ 0.20 * confirm_score
+- 0.15 * penalty_score
+
+composite_score =
+0.50 * technical_score
++ 0.35 * fundamental_score
++ 0.15 * risk_quality_score
+```
+
+The current fundamental layer uses:
+
+- `forward_pe`
+- `price_to_sales_ttm` as the live sales-multiple proxy
+- `p_to_fcf` computed from `marketCap / freeCashflow` when free cash flow is positive
+- `revenue_growth`
+- `earnings_growth`
+- `gross_margin`
+- `operating_margin`
+- `profit_margin`
+- `fcf_margin`
+- `return_on_equity`
+- `debt_to_equity`
+
+Because `yfinance` does not consistently expose a true forward price-to-sales field, the model currently uses trailing price-to-sales as the sales-multiple input.
+
+### Market Regime Filter
+
+The model uses `QQQ` as a regime filter. It only flips fully risk-on when:
+
+- `QQQ > 200MA`
+- `50MA > 200MA`
+- `QQQ > 21EMA`
+
+If that filter is not satisfied, the scanner shifts to `WAIT` / `REDUCE` / `SELL` behavior and the backtest moves to cash.
+
+### Important Caveat
+
+The backtest currently uses the current public Nasdaq-100 constituent list, not a point-in-time historical membership database. That means the backtest has survivorship bias and should be treated as a research tool, not a production-grade historical result.
+
+Also, the backtest is currently technical-only. The live scan includes the fundamental layer, but the historical backtest does not yet use point-in-time fundamental data.
 
 ## Methodology
 
