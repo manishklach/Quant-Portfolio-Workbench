@@ -40,6 +40,12 @@ UTC = timezone.utc
 EASTERN_OFFSET = timezone(timedelta(hours=-4))
 COINBASE_PRODUCTS_URL = "https://api.coinbase.com/api/v3/brokerage/market/products"
 DRAM_HOLDINGS_URL = "https://stockanalysis.com/etf/dram/holdings/"
+ETF_PROXY_CONFIG = {
+    "DRAM": {
+        "holdings_url": DRAM_HOLDINGS_URL,
+        "source_label": "etf_holdings_proxy_partial",
+    },
+}
 DRAM_PROXY_MAP = {
     "MICRON": "MU",
     "SANDISK": "SNDK",
@@ -184,11 +190,11 @@ def choose_after_hours_price(
     return after_hours_price, after_hours_source
 
 
-def fetch_dram_holdings() -> pd.DataFrame:
+def fetch_etf_holdings(holdings_url: str) -> pd.DataFrame:
     if requests is None:
         return pd.DataFrame()
     try:
-        html = requests.get(DRAM_HOLDINGS_URL, timeout=20, headers={"User-Agent": "Mozilla/5.0"}).text
+        html = requests.get(holdings_url, timeout=20, headers={"User-Agent": "Mozilla/5.0"}).text
         tables = pd.read_html(StringIO(html))
     except Exception:
         return pd.DataFrame()
@@ -221,8 +227,17 @@ def map_dram_component_ticker(symbol: str, name: str) -> str | None:
     return None
 
 
-def build_dram_proxy_snapshot(perp_cache: dict[str, dict[str, float | str | None]], prefer_perp: bool) -> dict[str, float | str | None]:
-    holdings = fetch_dram_holdings()
+def build_etf_proxy_snapshot(
+    ticker: str,
+    perp_cache: dict[str, dict[str, float | str | None]],
+    prefer_perp: bool,
+) -> dict[str, float | str | None]:
+    config = ETF_PROXY_CONFIG.get(ticker, {})
+    holdings_url = str(config.get("holdings_url") or "").strip()
+    if not holdings_url:
+        return {}
+
+    holdings = fetch_etf_holdings(holdings_url)
     if holdings.empty:
         return {}
 
@@ -231,7 +246,10 @@ def build_dram_proxy_snapshot(perp_cache: dict[str, dict[str, float | str | None
     covered_weight = 0.0
 
     for _, row in holdings.iterrows():
-        proxy_ticker = map_dram_component_ticker(row.get("Symbol"), row.get("Name"))
+        if ticker == "DRAM":
+            proxy_ticker = map_dram_component_ticker(row.get("Symbol"), row.get("Name"))
+        else:
+            proxy_ticker = None
         weight_pct = pd.to_numeric(row.get("weight_pct"), errors="coerce")
         if proxy_ticker is None or pd.isna(weight_pct) or weight_pct <= 0:
             continue
@@ -270,7 +288,7 @@ def build_dram_proxy_snapshot(perp_cache: dict[str, dict[str, float | str | None
         "weighted_return": weighted_return,
         "covered_weight": covered_weight,
         "components_used": rows,
-        "source": "dram_holdings_proxy_partial",
+        "source": str(config.get("source_label") or "etf_holdings_proxy_partial"),
     }
 
 
@@ -386,7 +404,7 @@ def build_after_hours_report(csv_path: Path, prefer_perp: bool = False, prefer_e
     holdings = load_schwab_holdings(csv_path)
     quote_cache: dict[str, dict[str, float | str | None]] = {}
     perp_cache = fetch_coinbase_equity_perp_snapshots()
-    dram_proxy = build_dram_proxy_snapshot(perp_cache, prefer_perp)
+    etf_proxy_cache: dict[str, dict[str, float | str | None]] = {}
     leveraged_proxy_cache: dict[str, dict[str, float | str | None]] = {}
     position_rows: list[dict[str, object]] = []
 
@@ -423,10 +441,13 @@ def build_after_hours_report(csv_path: Path, prefer_perp: bool = False, prefer_e
             if leveraged_proxy and (prefer_perp or after_hours_price is None):
                 after_hours_price = regular_price * (1.0 + float(leveraged_proxy["leveraged_return"]))
                 after_hours_source = str(leveraged_proxy["source"])
-        if ticker == "DRAM" and regular_price is not None and dram_proxy:
-            if prefer_etf_proxy or after_hours_price is None:
-                after_hours_price = regular_price * (1.0 + float(dram_proxy["weighted_return"]))
-                after_hours_source = str(dram_proxy["source"])
+        if ticker in ETF_PROXY_CONFIG and regular_price is not None:
+            if ticker not in etf_proxy_cache:
+                etf_proxy_cache[ticker] = build_etf_proxy_snapshot(ticker, perp_cache, prefer_perp)
+            etf_proxy = etf_proxy_cache.get(ticker, {})
+            if etf_proxy and (prefer_perp or prefer_etf_proxy or after_hours_price is None):
+                after_hours_price = regular_price * (1.0 + float(etf_proxy["weighted_return"]))
+                after_hours_source = str(etf_proxy["source"])
         pricing_method = "unchanged"
 
         if is_option:
@@ -462,7 +483,7 @@ def build_after_hours_report(csv_path: Path, prefer_perp: bool = False, prefer_e
                 "perp_last_price": perp_quote.get("last_price"),
                 "leveraged_proxy_underlying": leveraged_proxy_cache.get(ticker, {}).get("underlying") if ticker in LEVERAGED_PROXY_MAP else None,
                 "leveraged_proxy_leverage": leveraged_proxy_cache.get(ticker, {}).get("leverage") if ticker in LEVERAGED_PROXY_MAP else None,
-                "etf_proxy_coverage_pct": float(dram_proxy["covered_weight"]) * 100.0 if ticker == "DRAM" and dram_proxy else None,
+                "etf_proxy_coverage_pct": float(etf_proxy_cache.get(ticker, {}).get("covered_weight", 0.0)) * 100.0 if ticker in ETF_PROXY_CONFIG and etf_proxy_cache.get(ticker) else None,
                 "current_market_value": market_value,
                 "estimated_ah_price": ah_mark,
                 "estimated_ah_pl": ah_pl,
