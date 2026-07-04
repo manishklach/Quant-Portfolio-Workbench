@@ -39,7 +39,11 @@ DIVIDEND_YIELD = 0.0
 UTC = timezone.utc
 EASTERN_OFFSET = timezone(timedelta(hours=-4))
 COINBASE_PRODUCTS_URL = "https://api.coinbase.com/api/v3/brokerage/market/products"
+HYPERLIQUID_INFO_URL = "https://api.hyperliquid.xyz/info"
 DRAM_HOLDINGS_URL = "https://stockanalysis.com/etf/dram/holdings/"
+DIRECT_PERP_CONFIG = {
+    "DRAM": {"source": "hyperliquid", "symbol": "DRAM", "dex": "xyz"},
+}
 ETF_PROXY_CONFIG = {
     "DRAM": {
         "holdings_url": DRAM_HOLDINGS_URL,
@@ -188,6 +192,61 @@ def choose_after_hours_price(
     if after_hours_price is None and perp_quote.get("synthetic_price") is not None:
         return perp_quote["synthetic_price"], perp_quote.get("price_source")
     return after_hours_price, after_hours_source
+
+
+def fetch_hyperliquid_perp_snapshots(dex: str = "") -> dict[str, dict[str, float | str | None]]:
+    if requests is None:
+        return {}
+
+    try:
+        response = requests.post(
+            HYPERLIQUID_INFO_URL,
+            json={"type": "allMids", "dex": dex},
+            headers={"Content-Type": "application/json"},
+            timeout=20,
+        )
+        response.raise_for_status()
+        payload = response.json()
+    except Exception:
+        return {}
+
+    out: dict[str, dict[str, float | str | None]] = {}
+    for symbol, mid in payload.items():
+        symbol = str(symbol or "").strip().upper()
+        if not symbol:
+            continue
+
+        mid_price = pd.to_numeric(mid, errors="coerce")
+        synthetic_price = mid_price
+        price_source = "hyperliquid_mid"
+
+        out[symbol] = {
+            "ticker": symbol,
+            "symbol": symbol,
+            "synthetic_price": float(synthetic_price) if not pd.isna(synthetic_price) else None,
+            "mid_price": float(mid_price) if not pd.isna(mid_price) else None,
+            "price_source": price_source if not pd.isna(synthetic_price) else None,
+            "dex": dex,
+        }
+    return out
+
+
+def choose_direct_perp_price(
+    ticker: str,
+    direct_perp_cache: dict[str, dict[str, float | str | None]],
+) -> tuple[float | None, str | None]:
+    config = DIRECT_PERP_CONFIG.get(ticker, {})
+    source = str(config.get("source") or "").strip().lower()
+    symbol = str(config.get("symbol") or ticker).strip().upper()
+    dex = str(config.get("dex") or "").strip().lower()
+    if source != "hyperliquid":
+        return None, None
+
+    cache_key = f"{dex}:{symbol}".upper() if dex else symbol
+    perp_quote = direct_perp_cache.get(cache_key, {})
+    price = perp_quote.get("synthetic_price")
+    source_label = perp_quote.get("price_source")
+    return (price, source_label) if price is not None else (None, None)
 
 
 def fetch_etf_holdings(holdings_url: str) -> pd.DataFrame:
@@ -404,6 +463,12 @@ def build_after_hours_report(csv_path: Path, prefer_perp: bool = False, prefer_e
     holdings = load_schwab_holdings(csv_path)
     quote_cache: dict[str, dict[str, float | str | None]] = {}
     perp_cache = fetch_coinbase_equity_perp_snapshots()
+    direct_perp_cache: dict[str, dict[str, float | str | None]] = {}
+    for config in DIRECT_PERP_CONFIG.values():
+        if str(config.get("source") or "").strip().lower() == "hyperliquid":
+            dex = str(config.get("dex") or "").strip().lower()
+            if dex:
+                direct_perp_cache.update(fetch_hyperliquid_perp_snapshots(dex=dex))
     etf_proxy_cache: dict[str, dict[str, float | str | None]] = {}
     leveraged_proxy_cache: dict[str, dict[str, float | str | None]] = {}
     position_rows: list[dict[str, object]] = []
@@ -434,6 +499,11 @@ def build_after_hours_report(csv_path: Path, prefer_perp: bool = False, prefer_e
             perp_quote,
             prefer_perp=prefer_perp,
         )
+        if ticker in DIRECT_PERP_CONFIG and regular_price is not None:
+            direct_perp_price, direct_perp_source = choose_direct_perp_price(ticker, direct_perp_cache)
+            if direct_perp_price is not None and (prefer_perp or after_hours_price is None):
+                after_hours_price = direct_perp_price
+                after_hours_source = direct_perp_source
         if ticker in LEVERAGED_PROXY_MAP and regular_price is not None:
             if ticker not in leveraged_proxy_cache:
                 leveraged_proxy_cache[ticker] = build_leveraged_proxy_snapshot(ticker, perp_cache, prefer_perp)
@@ -445,7 +515,7 @@ def build_after_hours_report(csv_path: Path, prefer_perp: bool = False, prefer_e
             if ticker not in etf_proxy_cache:
                 etf_proxy_cache[ticker] = build_etf_proxy_snapshot(ticker, perp_cache, prefer_perp)
             etf_proxy = etf_proxy_cache.get(ticker, {})
-            if etf_proxy and (prefer_perp or prefer_etf_proxy or after_hours_price is None):
+            if etf_proxy and (prefer_etf_proxy or after_hours_price is None):
                 after_hours_price = regular_price * (1.0 + float(etf_proxy["weighted_return"]))
                 after_hours_source = str(etf_proxy["source"])
         pricing_method = "unchanged"
