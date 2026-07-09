@@ -1,20 +1,23 @@
 #!/usr/bin/env python3
-"""Estimate after-hours portfolio P/L from a Schwab holdings export.
+"""Estimate after-hours / overnight portfolio P/L from a Schwab holdings export.
 
 For stocks/ETFs:
   P/L = shares * (after_hours_price - regular_close_price)
 
 For options:
   - infer implied volatility from the regular-session option mark
-  - reprice the option using the after-hours underlying price
+  - reprice the option using the after-hours / overnight underlying price
   - if IV inference fails, fall back to intrinsic-change approximation
 """
 
 from __future__ import annotations
 
 import argparse
+import json
 import math
 import re
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from io import StringIO
 from datetime import datetime, time, timedelta, timezone
 from pathlib import Path
@@ -41,6 +44,10 @@ EASTERN_OFFSET = timezone(timedelta(hours=-4))
 COINBASE_PRODUCTS_URL = "https://api.coinbase.com/api/v3/brokerage/market/products"
 HYPERLIQUID_INFO_URL = "https://api.hyperliquid.xyz/info"
 DRAM_HOLDINGS_URL = "https://stockanalysis.com/etf/dram/holdings/"
+ROBINHOOD_QUOTE_URLS = (
+    "https://robinhood.com/us/en/stocks/{ticker}/",
+    "https://robinhood.com/us/en/etfs/{ticker}/",
+)
 DIRECT_PERP_CONFIG = {
     "DRAM": {"source": "hyperliquid", "symbol": "DRAM", "dex": "xyz"},
 }
@@ -64,9 +71,14 @@ DRAM_PROXY_MAP = {
 }
 LEVERAGED_PROXY_MAP = {
     "MUU": {"underlying": "MU", "leverage": 2.0, "label": "Direxion Daily MU Bull 2X ETF"},
-    "QQQI": {"underlying": "QQQ", "leverage": 1.0, "label": "QQQ Income ETF proxy"},
-    "XQQI": {"underlying": "QQQ", "leverage": 1.0, "label": "QQQ Income ETF proxy"},
+    "QQQI": {"underlying": "QQQ", "leverage": 1.0, "label": "QQQ Income ETF proxy", "max_direct_ah_proxy_gap": 0.0075},
+    "XQQI": {"underlying": "QQQ", "leverage": 1.0, "label": "QQQ Income ETF proxy", "max_direct_ah_proxy_gap": 0.0075},
 }
+
+REGULAR_OPEN = time(9, 30)
+REGULAR_CLOSE = time(16, 0)
+POST_MARKET_CLOSE = time(20, 0)
+OVERNIGHT_END = time(4, 0)
 
 
 def norm_cdf(x: float) -> float:
@@ -127,6 +139,202 @@ def year_fraction_to_expiry(expiration_text: str) -> float:
     return max((expiry_dt - now_dt).total_seconds() / (365.0 * 24.0 * 3600.0), 1.0 / 365.0)
 
 
+def classify_extended_session(timestamp_text: str | None) -> str | None:
+    if not timestamp_text:
+        return None
+    try:
+        dt = datetime.fromisoformat(str(timestamp_text).replace("Z", "+00:00")).astimezone(EASTERN_OFFSET)
+    except Exception:
+        return None
+
+    ts_time = dt.timetz().replace(tzinfo=None)
+    if REGULAR_CLOSE <= ts_time < POST_MARKET_CLOSE:
+        return "post_market"
+    if ts_time >= POST_MARKET_CLOSE or ts_time < OVERNIGHT_END:
+        return "overnight"
+    if OVERNIGHT_END <= ts_time < REGULAR_OPEN:
+        return "pre_market"
+    return None
+
+
+def find_robinhood_quote_payload(node: object, ticker: str) -> dict[str, object] | None:
+    if isinstance(node, dict):
+        symbol = str(node.get("symbol") or "").strip().upper()
+        if (
+            symbol == ticker
+            and (
+                "last_non_reg_trade_price" in node
+                or "last_extended_hours_trade_price" in node
+                or "previous_close" in node
+            )
+        ):
+            return node
+        for value in node.values():
+            found = find_robinhood_quote_payload(value, ticker)
+            if found is not None:
+                return found
+    elif isinstance(node, list):
+        for item in node:
+            found = find_robinhood_quote_payload(item, ticker)
+            if found is not None:
+                return found
+    return None
+
+
+def fetch_robinhood_quote_snapshot(ticker: str) -> dict[str, float | str | None]:
+    if requests is None:
+        return {"regular": None, "previous_close": None, "non_regular": None, "session": None, "source": None}
+
+    quote = None
+    for url_template in ROBINHOOD_QUOTE_URLS:
+        try:
+            response = requests.get(
+                url_template.format(ticker=ticker),
+                headers={"User-Agent": "Mozilla/5.0"},
+                timeout=20,
+            )
+            response.raise_for_status()
+        except Exception:
+            continue
+
+        match = re.search(r'<script id="__NEXT_DATA__" type="application/json">(.*?)</script>', response.text, re.S)
+        if not match:
+            continue
+
+        try:
+            payload = json.loads(match.group(1))
+        except Exception:
+            continue
+
+        quote = find_robinhood_quote_payload(payload, ticker)
+        if quote:
+            break
+
+    if not quote:
+        return {"regular": None, "previous_close": None, "non_regular": None, "session": None, "source": None}
+
+    non_regular = pd.to_numeric(
+        quote.get("last_non_reg_trade_price", quote.get("last_extended_hours_trade_price")),
+        errors="coerce",
+    )
+    regular = pd.to_numeric(quote.get("last_trade_price"), errors="coerce")
+    previous_close = pd.to_numeric(
+        quote.get("adjusted_previous_close", quote.get("previous_close")),
+        errors="coerce",
+    )
+    timestamp_text = str(
+        quote.get("venue_last_non_reg_trade_time")
+        or quote.get("updated_at")
+        or ""
+    ).strip()
+    session = classify_extended_session(timestamp_text)
+
+    return {
+        "regular": float(regular) if not pd.isna(regular) else None,
+        "previous_close": float(previous_close) if not pd.isna(previous_close) else None,
+        "non_regular": float(non_regular) if not pd.isna(non_regular) else None,
+        "session": session,
+        "source": f"robinhood_{session}" if session else None,
+        "timestamp": timestamp_text or None,
+    }
+
+
+_BATCH_QUOTES: dict[str, dict[str, float | str | None]] = {}
+_ETF_HOLDINGS_CACHE: dict[str, pd.DataFrame] = {}
+_USE_ROBINHOOD = True
+
+
+def set_use_robinhood(val: bool):
+    global _USE_ROBINHOOD
+    _USE_ROBINHOOD = val
+
+
+def set_batch_quotes(quotes: dict[str, dict[str, float | str | None]]):
+    _BATCH_QUOTES.clear()
+    _BATCH_QUOTES.update(quotes)
+
+
+def build_batch_quote_cache(tickers: list[str]) -> dict[str, dict[str, float | str | None]]:
+    if yf is None:
+        return {}
+
+    valid_tickers = [ticker for ticker in tickers if re.match(r"^[A-Z][A-Z0-9.\-]*$", ticker)]
+    if not valid_tickers:
+        return {}
+
+    try:
+        hist = yf.download(
+            tickers=valid_tickers,
+            period="2d",
+            interval="5m",
+            prepost=True,
+            progress=False,
+            auto_adjust=False,
+            threads=True,
+            group_by="column",
+        )
+    except Exception:
+        return {}
+
+    if hist.empty or "Close" not in hist.columns:
+        return {}
+
+    close_df = hist["Close"]
+    if isinstance(close_df, pd.Series):
+        close_df = close_df.to_frame(name=valid_tickers[0])
+
+    out: dict[str, dict[str, float | str | None]] = {}
+    for ticker in close_df.columns:
+        series = close_df[ticker].dropna()
+        if series.empty:
+            continue
+
+        try:
+            eastern_index = series.index.tz_convert(EASTERN_OFFSET)
+        except Exception:
+            eastern_index = series.index
+
+        frame = pd.DataFrame({"price": series.to_numpy()}, index=eastern_index)
+        regular_mask = frame.index.indexer_between_time("09:30", "16:00")
+        regular_frame = frame.iloc[regular_mask] if len(regular_mask) else frame.iloc[0:0]
+        extended_frame = frame.drop(regular_frame.index, errors="ignore")
+
+        regular = float(regular_frame["price"].iloc[-1]) if not regular_frame.empty else None
+        previous_close = None
+        if regular is not None:
+            prior_regular_frame = regular_frame[regular_frame.index.date < regular_frame.index[-1].date()]
+            if not prior_regular_frame.empty:
+                previous_close = float(prior_regular_frame["price"].iloc[-1])
+
+        post = None
+        post_source = None
+        extended_hours_session = None
+        if not extended_frame.empty:
+            latest_extended_ts = extended_frame.index[-1]
+            latest_extended_price = float(extended_frame["price"].iloc[-1])
+            ts_time = latest_extended_ts.timetz().replace(tzinfo=None)
+            post = latest_extended_price
+            if REGULAR_CLOSE <= ts_time < POST_MARKET_CLOSE or ts_time >= POST_MARKET_CLOSE:
+                post_source = "yahoo_post"
+                extended_hours_session = "post_market"
+            elif OVERNIGHT_END <= ts_time < REGULAR_OPEN:
+                post_source = "yahoo_pre"
+                extended_hours_session = "overnight_pre_market"
+            else:
+                post_source = "yahoo_post"
+                extended_hours_session = "post_market"
+
+        out[str(ticker).upper()] = {
+            "regular": regular,
+            "previous_close": previous_close,
+            "post": post,
+            "post_source": post_source,
+            "extended_hours_session": extended_hours_session,
+            "exchange": None,
+        }
+    return out
+
+
 def fetch_quote_snapshot(ticker: str, *, allow_numeric_symbol: bool = False) -> dict[str, float | str | None]:
     if yf is None:
         raise RuntimeError("yfinance not installed. Run: pip install yfinance")
@@ -135,47 +343,97 @@ def fetch_quote_snapshot(ticker: str, *, allow_numeric_symbol: bool = False) -> 
     else:
         is_valid = bool(re.match(r"^[A-Z][A-Z0-9.\-]*$", ticker))
     if not is_valid:
-        return {"regular": None, "previous_close": None, "post": None, "exchange": None}
+        return {"regular": None, "previous_close": None, "post": None, "post_source": None, "extended_hours_session": None, "exchange": None}
 
-    tk = yf.Ticker(ticker)
-    info = {}
-    fast = {}
-    try:
-        info = tk.info or {}
-    except Exception:
-        info = {}
-    try:
-        fast = dict(tk.fast_info)
-    except Exception:
-        fast = {}
-
-    regular = info.get("regularMarketPrice")
-    if regular is None or pd.isna(regular):
-        regular = fast.get("lastPrice")
-    previous_close = info.get("regularMarketPreviousClose")
-    if previous_close is None or pd.isna(previous_close):
-        previous_close = fast.get("regularMarketPreviousClose")
-    post = info.get("postMarketPrice")
-    post_source = "yahoo_post"
-    if post is None or pd.isna(post):
-        post = fast.get("postMarketPrice")
-        post_source = "yahoo_post"
-    if post is None or pd.isna(post):
-        post = info.get("preMarketPrice")
-        post_source = "yahoo_pre"
-    if post is None or pd.isna(post):
-        post = fast.get("preMarketPrice")
-        post_source = "yahoo_pre"
-    if post is None or pd.isna(post):
+    batch_quote = _BATCH_QUOTES.get(ticker)
+    if batch_quote is not None:
+        regular = batch_quote.get("regular")
+        previous_close = batch_quote.get("previous_close")
+        post = batch_quote.get("post")
+        post_source = batch_quote.get("post_source")
+        extended_hours_session = batch_quote.get("extended_hours_session")
+        exchange = batch_quote.get("exchange")
+        tk_info_needed = False
+    else:
+        regular = None
+        previous_close = None
+        post = None
         post_source = None
-    exchange = info.get("exchange") or fast.get("exchange")
+        extended_hours_session = None
+        exchange = None
+        tk_info_needed = True
+
+    if tk_info_needed:
+        tk = yf.Ticker(ticker)
+        try:
+            info = tk.info or {}
+        except Exception:
+            info = {}
+        try:
+            fast = dict(tk.fast_info)
+        except Exception:
+            fast = {}
+
+        if regular is None:
+            regular = info.get("regularMarketPrice")
+            if regular is None or pd.isna(regular):
+                regular = fast.get("lastPrice")
+        if previous_close is None:
+            previous_close = info.get("regularMarketPreviousClose")
+            if previous_close is None or pd.isna(previous_close):
+                previous_close = fast.get("regularMarketPreviousClose")
+        post = info.get("postMarketPrice")
+        post_source = "yahoo_post"
+        if post is None or pd.isna(post):
+            post = fast.get("postMarketPrice")
+            post_source = "yahoo_post"
+        if post is None or pd.isna(post):
+            post = info.get("preMarketPrice")
+            post_source = "yahoo_pre"
+        if post is None or pd.isna(post):
+            post = fast.get("preMarketPrice")
+            post_source = "yahoo_pre"
+        if post is None or pd.isna(post):
+            post_source = None
+        if post_source == "yahoo_post":
+            extended_hours_session = "post_market"
+        elif post_source == "yahoo_pre":
+            extended_hours_session = "overnight_pre_market"
+        exchange = info.get("exchange") or fast.get("exchange")
+    else:
+        post = batch_quote.get("post") if batch_quote else None
+        post_source = batch_quote.get("post_source") if batch_quote else None
+        extended_hours_session = batch_quote.get("extended_hours_session") if batch_quote else None
+        if post is None or pd.isna(post) or post_source is None:
+            tk = yf.Ticker(ticker)
+            try:
+                fast = dict(tk.fast_info)
+            except Exception:
+                fast = {}
+            post = fast.get("postMarketPrice")
+            post_source = "yahoo_post"
+            if post is None or pd.isna(post):
+                post = fast.get("preMarketPrice")
+                post_source = "yahoo_pre"
+            if post is None or pd.isna(post):
+                post_source = None
+            if post_source == "yahoo_post":
+                extended_hours_session = "post_market"
+            elif post_source == "yahoo_pre":
+                extended_hours_session = "overnight_pre_market"
+
+    robinhood_quote = fetch_robinhood_quote_snapshot(ticker) if _USE_ROBINHOOD else {}
 
     return {
         "regular": float(regular) if regular is not None and not pd.isna(regular) else None,
         "previous_close": float(previous_close) if previous_close is not None and not pd.isna(previous_close) else None,
         "post": float(post) if post is not None and not pd.isna(post) else None,
         "post_source": post_source,
+        "extended_hours_session": extended_hours_session,
         "exchange": exchange,
+        "overnight": robinhood_quote.get("non_regular"),
+        "overnight_source": robinhood_quote.get("source"),
+        "overnight_timestamp": robinhood_quote.get("timestamp"),
     }
 
 
@@ -185,12 +443,21 @@ def choose_after_hours_price(
     perp_quote: dict[str, float | str | None],
     *,
     prefer_perp: bool = False,
+    overnight: bool = False,
 ) -> tuple[float | None, str | None]:
     if prefer_perp and perp_quote.get("synthetic_price") is not None:
         return perp_quote["synthetic_price"], perp_quote.get("price_source")
 
+    if overnight:
+        overnight_price = quote.get("overnight")
+        overnight_source = quote.get("overnight_source")
+        if overnight_price is not None:
+            return overnight_price, overnight_source
+
     after_hours_price = quote.get("post")
     after_hours_source = quote.get("post_source")
+    if overnight and not prefer_perp:
+        return after_hours_price, after_hours_source
     if after_hours_price is None and perp_quote.get("synthetic_price") is not None:
         return perp_quote["synthetic_price"], perp_quote.get("price_source")
     return after_hours_price, after_hours_source
@@ -252,6 +519,8 @@ def choose_direct_perp_price(
 
 
 def fetch_etf_holdings(holdings_url: str) -> pd.DataFrame:
+    if holdings_url in _ETF_HOLDINGS_CACHE:
+        return _ETF_HOLDINGS_CACHE[holdings_url].copy()
     if requests is None:
         return pd.DataFrame()
     try:
@@ -272,6 +541,7 @@ def fetch_etf_holdings(holdings_url: str) -> pd.DataFrame:
         errors="coerce",
     )
     holdings["name_upper"] = holdings["Name"].astype(str).str.upper()
+    _ETF_HOLDINGS_CACHE[holdings_url] = holdings.copy()
     return holdings
 
 
@@ -292,6 +562,8 @@ def build_etf_proxy_snapshot(
     ticker: str,
     perp_cache: dict[str, dict[str, float | str | None]],
     prefer_perp: bool,
+    quote_cache: dict[str, dict[str, float | str | None]],
+    overnight: bool = False,
 ) -> dict[str, float | str | None]:
     config = ETF_PROXY_CONFIG.get(ticker, {})
     holdings_url = str(config.get("holdings_url") or "").strip()
@@ -315,7 +587,12 @@ def build_etf_proxy_snapshot(
         if proxy_ticker is None or pd.isna(weight_pct) or weight_pct <= 0:
             continue
 
-        quote = fetch_quote_snapshot(proxy_ticker, allow_numeric_symbol=("." in proxy_ticker and proxy_ticker[0].isdigit()))
+        if proxy_ticker not in quote_cache:
+            quote_cache[proxy_ticker] = fetch_quote_snapshot(
+                proxy_ticker,
+                allow_numeric_symbol=("." in proxy_ticker and proxy_ticker[0].isdigit()),
+            )
+        quote = quote_cache[proxy_ticker]
         perp_quote = perp_cache.get(proxy_ticker, {})
         regular = quote.get("regular")
         after_hours_price, after_hours_source = choose_after_hours_price(
@@ -323,6 +600,7 @@ def build_etf_proxy_snapshot(
             quote,
             perp_quote,
             prefer_perp=prefer_perp,
+            overnight=overnight,
         )
         if regular is None or after_hours_price is None or regular == 0:
             continue
@@ -357,6 +635,8 @@ def build_leveraged_proxy_snapshot(
     ticker: str,
     perp_cache: dict[str, dict[str, float | str | None]],
     prefer_perp: bool,
+    quote_cache: dict[str, dict[str, float | str | None]],
+    overnight: bool = False,
 ) -> dict[str, float | str | None]:
     proxy_meta = LEVERAGED_PROXY_MAP.get(ticker)
     if not proxy_meta:
@@ -364,7 +644,9 @@ def build_leveraged_proxy_snapshot(
 
     underlying = str(proxy_meta["underlying"]).upper()
     leverage = float(proxy_meta["leverage"])
-    quote = fetch_quote_snapshot(underlying)
+    if underlying not in quote_cache:
+        quote_cache[underlying] = fetch_quote_snapshot(underlying)
+    quote = quote_cache[underlying]
     perp_quote = perp_cache.get(underlying, {})
     regular = quote.get("regular")
     after_hours_price, after_hours_source = choose_after_hours_price(
@@ -372,6 +654,7 @@ def build_leveraged_proxy_snapshot(
         quote,
         perp_quote,
         prefer_perp=prefer_perp,
+        overnight=overnight,
     )
     if regular is None or after_hours_price is None or regular == 0:
         return {}
@@ -461,8 +744,28 @@ def estimate_option_after_hours_price(row: pd.Series, underlying_regular: float,
     return fallback_price, "intrinsic_fallback"
 
 
-def build_after_hours_report(csv_path: Path, prefer_perp: bool = False, prefer_etf_proxy: bool = False) -> tuple[pd.DataFrame, pd.DataFrame]:
+def build_after_hours_report(
+    csv_path: Path,
+    prefer_perp: bool = False,
+    prefer_etf_proxy: bool = False,
+    overnight: bool = False,
+    use_robinhood: bool = False,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
     holdings = load_schwab_holdings(csv_path)
+    set_use_robinhood(use_robinhood)
+
+    unique_tickers = {str(ticker).strip().upper() for ticker in holdings["Underlying"].dropna().astype(str)}
+    unique_tickers.update(
+        str(meta.get("underlying") or "").strip().upper()
+        for meta in LEVERAGED_PROXY_MAP.values()
+        if str(meta.get("underlying") or "").strip()
+    )
+    if "DRAM" in unique_tickers:
+        unique_tickers.update({"MU", "SNDK", "STX", "WDC", "000660.KS", "005930.KS", "285A.T", "2408.TW", "2344.TW", "603986.SS"})
+    batch_quotes = build_batch_quote_cache(sorted(unique_tickers))
+    if batch_quotes:
+        set_batch_quotes(batch_quotes)
+
     quote_cache: dict[str, dict[str, float | str | None]] = {}
     perp_cache = fetch_coinbase_equity_perp_snapshots()
     direct_perp_cache: dict[str, dict[str, float | str | None]] = {}
@@ -485,7 +788,7 @@ def build_after_hours_report(csv_path: Path, prefer_perp: bool = False, prefer_e
             try:
                 quote_cache[ticker] = fetch_quote_snapshot(ticker)
             except Exception:
-                quote_cache[ticker] = {"regular": None, "previous_close": None, "post": None, "exchange": None}
+                quote_cache[ticker] = {"regular": None, "previous_close": None, "post": None, "post_source": None, "extended_hours_session": None, "exchange": None}
         quote = quote_cache[ticker]
         perp_quote = perp_cache.get(ticker, {})
 
@@ -500,6 +803,7 @@ def build_after_hours_report(csv_path: Path, prefer_perp: bool = False, prefer_e
             quote,
             perp_quote,
             prefer_perp=prefer_perp,
+            overnight=overnight,
         )
         if ticker in DIRECT_PERP_CONFIG and regular_price is not None:
             direct_perp_price, direct_perp_source = choose_direct_perp_price(ticker, direct_perp_cache)
@@ -508,14 +812,43 @@ def build_after_hours_report(csv_path: Path, prefer_perp: bool = False, prefer_e
                 after_hours_source = direct_perp_source
         if ticker in LEVERAGED_PROXY_MAP and regular_price is not None:
             if ticker not in leveraged_proxy_cache:
-                leveraged_proxy_cache[ticker] = build_leveraged_proxy_snapshot(ticker, perp_cache, prefer_perp)
+                leveraged_proxy_cache[ticker] = build_leveraged_proxy_snapshot(
+                    ticker,
+                    perp_cache,
+                    prefer_perp,
+                    quote_cache,
+                    overnight=overnight,
+                )
             leveraged_proxy = leveraged_proxy_cache.get(ticker, {})
-            if leveraged_proxy and (prefer_perp or after_hours_price is None):
-                after_hours_price = regular_price * (1.0 + float(leveraged_proxy["leveraged_return"]))
-                after_hours_source = str(leveraged_proxy["source"])
+            if leveraged_proxy:
+                proxy_return = float(leveraged_proxy["leveraged_return"])
+                direct_return = None
+                if after_hours_price is not None and regular_price not in (None, 0):
+                    direct_return = (after_hours_price - regular_price) / regular_price
+
+                proxy_meta = LEVERAGED_PROXY_MAP.get(ticker, {})
+                max_gap = proxy_meta.get("max_direct_ah_proxy_gap")
+                use_proxy = prefer_perp or after_hours_price is None
+                if (
+                    not use_proxy
+                    and direct_return is not None
+                    and max_gap is not None
+                    and abs(float(direct_return) - proxy_return) > float(max_gap)
+                ):
+                    use_proxy = True
+
+                if use_proxy:
+                    after_hours_price = regular_price * (1.0 + proxy_return)
+                    after_hours_source = str(leveraged_proxy["source"])
         if ticker in ETF_PROXY_CONFIG and regular_price is not None:
             if ticker not in etf_proxy_cache:
-                etf_proxy_cache[ticker] = build_etf_proxy_snapshot(ticker, perp_cache, prefer_perp)
+                etf_proxy_cache[ticker] = build_etf_proxy_snapshot(
+                    ticker,
+                    perp_cache,
+                    prefer_perp,
+                    quote_cache,
+                    overnight=overnight,
+                )
             etf_proxy = etf_proxy_cache.get(ticker, {})
             if etf_proxy and (prefer_etf_proxy or after_hours_price is None):
                 after_hours_price = regular_price * (1.0 + float(etf_proxy["weighted_return"]))
@@ -535,7 +868,7 @@ def build_after_hours_report(csv_path: Path, prefer_perp: bool = False, prefer_e
             price_change = after_hours_price - regular_price
             ah_pl = qty * price_change
             ah_mark = after_hours_price
-            pricing_method = "post_market"
+            pricing_method = "extended_hours"
         else:
             ah_pl = 0.0
             ah_mark = clean_numeric(row.get("Price")) if not is_option else clean_numeric(row.get("Price"))
@@ -550,6 +883,17 @@ def build_after_hours_report(csv_path: Path, prefer_perp: bool = False, prefer_e
                 "regular_underlying": regular_price,
                 "after_hours_underlying": after_hours_price,
                 "after_hours_source": after_hours_source,
+                "extended_hours_session": (
+                    "perp"
+                    if isinstance(after_hours_source, str) and after_hours_source.startswith("coinbase_perp")
+                    else "overnight"
+                    if isinstance(after_hours_source, str) and after_hours_source == "robinhood_overnight"
+                    else "post_market"
+                    if isinstance(after_hours_source, str) and after_hours_source == "robinhood_post_market"
+                    else "pre_market"
+                    if isinstance(after_hours_source, str) and after_hours_source == "robinhood_pre_market"
+                    else quote.get("extended_hours_session")
+                ),
                 "perp_symbol": perp_quote.get("product_id"),
                 "perp_index_price": perp_quote.get("index_price"),
                 "perp_last_price": perp_quote.get("last_price"),
@@ -576,13 +920,15 @@ def build_after_hours_report(csv_path: Path, prefer_perp: bool = False, prefer_e
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Estimate after-hours portfolio P/L from my_holdings.csv")
+    parser = argparse.ArgumentParser(description="Estimate after-hours / overnight portfolio P/L from my_holdings.csv")
     parser.add_argument("csv", nargs="?", help="Optional positional path to holdings CSV")
     parser.add_argument("--file", default=None, help="Path to holdings CSV (default: my_holdings.csv next to script)")
     parser.add_argument("--output", default=None, help="Optional CSV path for position-level output")
     parser.add_argument("--list-perps", action="store_true", help="Print held tickers that have supported perp-based pricing sources")
     parser.add_argument("--prefer-perp", action="store_true", help="Prefer Coinbase equity perpetual prices over Yahoo post/pre-market when available")
     parser.add_argument("--prefer-etf-proxy", action="store_true", help="Prefer ETF basket proxy pricing for supported ETFs like DRAM")
+    parser.add_argument("--overnight", action="store_true", help="Use overnight/pre-market quotes only from Yahoo when available; separate from the default post-market path.")
+    parser.add_argument("--robinhood", action="store_true", help="Enable Robinhood 24h quote scraping (slow, off by default)")
     args = parser.parse_args()
 
     csv_path = default_csv_path(args.file or args.csv, __file__)
@@ -666,7 +1012,7 @@ def main() -> int:
                         try:
                             quote_cache[underlying] = fetch_quote_snapshot(underlying)
                         except Exception:
-                            quote_cache[underlying] = {"regular": None, "previous_close": None, "post": None, "exchange": None}
+                            quote_cache[underlying] = {"regular": None, "previous_close": None, "post": None, "post_source": None, "extended_hours_session": None, "exchange": None}
 
                     underlying_quote = quote_cache.get(underlying, {})
                     underlying_perp = coinbase_perps.get(underlying, {})
@@ -697,12 +1043,41 @@ def main() -> int:
         csv_path,
         prefer_perp=args.prefer_perp,
         prefer_etf_proxy=args.prefer_etf_proxy,
+        overnight=args.overnight,
+        use_robinhood=args.robinhood,
     )
+
+    if args.overnight:
+        non_option_positions = positions[~positions["is_option"]].copy()
+        if not non_option_positions.empty:
+            overnight_count = int((non_option_positions["extended_hours_session"] == "overnight").sum())
+            premarket_count = int(
+                non_option_positions["extended_hours_session"].isin(["pre_market", "overnight_pre_market"]).sum()
+            )
+            post_market_count = int((non_option_positions["extended_hours_session"] == "post_market").sum())
+            perp_count = int((non_option_positions["extended_hours_session"] == "perp").sum())
+            missing_count = int(non_option_positions["after_hours_underlying"].isna().sum())
+            print("\nOvernight Session Check")
+            print(f"Robinhood/Yahoo quotes tagged as overnight: {overnight_count}")
+            print(f"Robinhood/Yahoo quotes tagged as pre-market: {premarket_count}")
+            print(f"Robinhood/Yahoo quotes tagged as post-market: {post_market_count}")
+            print(f"Perp prices used via explicit --prefer-perp: {perp_count}")
+            print(f"Positions with no usable overnight quote: {missing_count}")
+            if overnight_count == 0 and post_market_count > 0 and not args.prefer_perp and premarket_count == 0:
+                print(
+                    "No true overnight prints were available yet for the current run. "
+                    "The script used the latest Robinhood 24-hour market quote path, which is currently still tagged as post-market."
+                )
+            elif overnight_count == 0 and premarket_count == 0 and missing_count > 0:
+                print(
+                    "No usable Robinhood/Yahoo overnight quotes were available for the current run. "
+                    "If you want fallback pricing, rerun with --overnight --prefer-perp where supported."
+                )
 
     total_market_value = positions["current_market_value"].sum()
     total_ah_pl = positions["estimated_ah_pl"].sum()
 
-    print("\nAfter-Hours Portfolio Estimate")
+    print("\nAfter-Hours / Overnight Portfolio Estimate")
     print("=" * 88)
     print("\nBy Ticker")
     print(by_ticker.to_string(index=False))
