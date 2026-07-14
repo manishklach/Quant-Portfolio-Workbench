@@ -295,34 +295,48 @@ def build_batch_quote_cache(tickers: list[str]) -> dict[str, dict[str, float | s
             eastern_index = series.index
 
         frame = pd.DataFrame({"price": series.to_numpy()}, index=eastern_index)
-        regular_mask = frame.index.indexer_between_time("09:30", "16:00")
-        regular_frame = frame.iloc[regular_mask] if len(regular_mask) else frame.iloc[0:0]
-        extended_frame = frame.drop(regular_frame.index, errors="ignore")
+        latest_date = frame.index[-1].date()
+        latest_day_frame = frame[frame.index.date == latest_date]
+        regular_mask = latest_day_frame.index.indexer_between_time("09:30", "16:00")
+        regular_frame = latest_day_frame.iloc[regular_mask] if len(regular_mask) else latest_day_frame.iloc[0:0]
 
         regular = float(regular_frame["price"].iloc[-1]) if not regular_frame.empty else None
+        if regular is None:
+            any_regular_mask = frame.index.indexer_between_time("09:30", "16:00")
+            any_regular_frame = frame.iloc[any_regular_mask] if len(any_regular_mask) else frame.iloc[0:0]
+            if not any_regular_frame.empty:
+                regular = float(any_regular_frame["price"].iloc[-1])
+
         previous_close = None
-        if regular is not None:
-            prior_regular_frame = regular_frame[regular_frame.index.date < regular_frame.index[-1].date()]
+        any_regular_mask = frame.index.indexer_between_time("09:30", "16:00")
+        any_regular_frame = frame.iloc[any_regular_mask] if len(any_regular_mask) else frame.iloc[0:0]
+        if not any_regular_frame.empty:
+            prior_regular_frame = any_regular_frame[any_regular_frame.index.date < latest_date]
             if not prior_regular_frame.empty:
                 previous_close = float(prior_regular_frame["price"].iloc[-1])
 
         post = None
         post_source = None
         extended_hours_session = None
-        if not extended_frame.empty:
-            latest_extended_ts = extended_frame.index[-1]
-            latest_extended_price = float(extended_frame["price"].iloc[-1])
-            ts_time = latest_extended_ts.timetz().replace(tzinfo=None)
-            post = latest_extended_price
-            if REGULAR_CLOSE <= ts_time < POST_MARKET_CLOSE or ts_time >= POST_MARKET_CLOSE:
-                post_source = "yahoo_post"
-                extended_hours_session = "post_market"
-            elif OVERNIGHT_END <= ts_time < REGULAR_OPEN:
-                post_source = "yahoo_pre"
-                extended_hours_session = "overnight_pre_market"
-            else:
-                post_source = "yahoo_post"
-                extended_hours_session = "post_market"
+        overnight = None
+        overnight_source = None
+        overnight_session = None
+
+        post_frame = latest_day_frame[
+            latest_day_frame.index.map(lambda ts: ts.timetz().replace(tzinfo=None) >= REGULAR_CLOSE)
+        ]
+        if not post_frame.empty:
+            post = float(post_frame["price"].iloc[-1])
+            post_source = "yahoo_post"
+            extended_hours_session = "post_market"
+
+        overnight_frame = latest_day_frame[
+            latest_day_frame.index.map(lambda ts: ts.timetz().replace(tzinfo=None) < REGULAR_OPEN)
+        ]
+        if not overnight_frame.empty:
+            overnight = float(overnight_frame["price"].iloc[-1])
+            overnight_source = "yahoo_pre"
+            overnight_session = "overnight_pre_market"
 
         out[str(ticker).upper()] = {
             "regular": regular,
@@ -330,6 +344,9 @@ def build_batch_quote_cache(tickers: list[str]) -> dict[str, dict[str, float | s
             "post": post,
             "post_source": post_source,
             "extended_hours_session": extended_hours_session,
+            "overnight": overnight,
+            "overnight_source": overnight_source,
+            "overnight_session": overnight_session,
             "exchange": None,
         }
     return out
@@ -352,6 +369,9 @@ def fetch_quote_snapshot(ticker: str, *, allow_numeric_symbol: bool = False) -> 
         post = batch_quote.get("post")
         post_source = batch_quote.get("post_source")
         extended_hours_session = batch_quote.get("extended_hours_session")
+        overnight = batch_quote.get("overnight")
+        overnight_source = batch_quote.get("overnight_source")
+        overnight_session = batch_quote.get("overnight_session")
         exchange = batch_quote.get("exchange")
         tk_info_needed = False
     else:
@@ -360,6 +380,9 @@ def fetch_quote_snapshot(ticker: str, *, allow_numeric_symbol: bool = False) -> 
         post = None
         post_source = None
         extended_hours_session = None
+        overnight = None
+        overnight_source = None
+        overnight_session = None
         exchange = None
         tk_info_needed = True
 
@@ -399,12 +422,18 @@ def fetch_quote_snapshot(ticker: str, *, allow_numeric_symbol: bool = False) -> 
             extended_hours_session = "post_market"
         elif post_source == "yahoo_pre":
             extended_hours_session = "overnight_pre_market"
+            overnight = post
+            overnight_source = post_source
+            overnight_session = extended_hours_session
+            post = None
+            post_source = None
+            extended_hours_session = None
         exchange = info.get("exchange") or fast.get("exchange")
     else:
         post = batch_quote.get("post") if batch_quote else None
         post_source = batch_quote.get("post_source") if batch_quote else None
         extended_hours_session = batch_quote.get("extended_hours_session") if batch_quote else None
-        if post is None or pd.isna(post) or post_source is None:
+        if (post is None or pd.isna(post) or post_source is None) and (overnight is None or pd.isna(overnight)):
             tk = yf.Ticker(ticker)
             try:
                 fast = dict(tk.fast_info)
@@ -420,9 +449,18 @@ def fetch_quote_snapshot(ticker: str, *, allow_numeric_symbol: bool = False) -> 
             if post_source == "yahoo_post":
                 extended_hours_session = "post_market"
             elif post_source == "yahoo_pre":
-                extended_hours_session = "overnight_pre_market"
+                overnight = post
+                overnight_source = post_source
+                overnight_session = "overnight_pre_market"
+                post = None
+                post_source = None
+                extended_hours_session = None
 
     robinhood_quote = fetch_robinhood_quote_snapshot(ticker) if _USE_ROBINHOOD else {}
+    if robinhood_quote.get("session") in {"overnight", "pre_market"}:
+        overnight = robinhood_quote.get("non_regular")
+        overnight_source = robinhood_quote.get("source")
+        overnight_session = "overnight_pre_market" if robinhood_quote.get("session") == "pre_market" else "overnight"
 
     return {
         "regular": float(regular) if regular is not None and not pd.isna(regular) else None,
@@ -431,8 +469,9 @@ def fetch_quote_snapshot(ticker: str, *, allow_numeric_symbol: bool = False) -> 
         "post_source": post_source,
         "extended_hours_session": extended_hours_session,
         "exchange": exchange,
-        "overnight": robinhood_quote.get("non_regular"),
-        "overnight_source": robinhood_quote.get("source"),
+        "overnight": float(overnight) if overnight is not None and not pd.isna(overnight) else None,
+        "overnight_source": overnight_source,
+        "overnight_session": overnight_session,
         "overnight_timestamp": robinhood_quote.get("timestamp"),
     }
 
@@ -453,11 +492,11 @@ def choose_after_hours_price(
         overnight_source = quote.get("overnight_source")
         if overnight_price is not None:
             return overnight_price, overnight_source
+        if not prefer_perp:
+            return None, None
 
     after_hours_price = quote.get("post")
     after_hours_source = quote.get("post_source")
-    if overnight and not prefer_perp:
-        return after_hours_price, after_hours_source
     if after_hours_price is None and perp_quote.get("synthetic_price") is not None:
         return perp_quote["synthetic_price"], perp_quote.get("price_source")
     return after_hours_price, after_hours_source
@@ -886,8 +925,16 @@ def build_after_hours_report(
                 "extended_hours_session": (
                     "perp"
                     if isinstance(after_hours_source, str) and after_hours_source.startswith("coinbase_perp")
+                    else quote.get("overnight_session")
+                    if after_hours_source == "yahoo_pre"
                     else "overnight"
                     if isinstance(after_hours_source, str) and after_hours_source == "robinhood_overnight"
+                    else "overnight_pre_market"
+                    if (
+                        isinstance(after_hours_source, str)
+                        and after_hours_source.startswith("leveraged_proxy_")
+                        and leveraged_proxy_cache.get(ticker, {}).get("underlying_source") == "yahoo_pre"
+                    )
                     else "post_market"
                     if isinstance(after_hours_source, str) and after_hours_source == "robinhood_post_market"
                     else "pre_market"
