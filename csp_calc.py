@@ -359,6 +359,100 @@ def find_all_short_puts(df_puts, stock_prices, stock_day_changes):
     return pd.DataFrame(short_rows)
 
 
+def find_put_spread_short_legs(df_puts, stock_prices, stock_day_changes):
+    spread_rows = []
+    delta_cache = {}
+
+    for (_, _), group in df_puts.groupby(['Ticker', 'Expiration']):
+        longs = []
+        shorts = []
+
+        for _, row in group.sort_values(by='Strike Price', ascending=False).iterrows():
+            qty = float(row['Qty'])
+            if qty > 0:
+                longs.append({'strike': float(row['Strike Price']), 'remaining': qty, 'row': row.copy()})
+            elif qty < 0:
+                shorts.append(row.copy())
+
+        for short_row in shorts:
+            remaining_short = abs(float(short_row['Qty']))
+            short_strike = float(short_row['Strike Price'])
+            candidates = [leg for leg in longs if leg['remaining'] > 0 and leg['strike'] < short_strike]
+            candidates.sort(key=lambda leg: leg['strike'], reverse=True)
+
+            for long_leg in candidates:
+                if remaining_short <= 0:
+                    break
+                matched = min(remaining_short, long_leg['remaining'])
+                long_leg['remaining'] -= matched
+                remaining_short -= matched
+
+                spread_leg = short_row.copy()
+                ticker = str(short_row['Ticker']).strip().upper()
+                expiration = short_row['Expiration']
+                current_stock_price = stock_prices.get(ticker)
+                stock_day_change = stock_day_changes.get(ticker, pd.NA)
+                delta_key = (ticker, expiration, short_strike)
+
+                spread_leg['Contracts Sold'] = matched
+                spread_leg['Current Stock Price'] = current_stock_price
+                spread_leg['Stock Day Change Numeric'] = stock_day_change
+                spread_leg['Long Strike Price'] = float(long_leg['strike'])
+                spread_leg['Spread Width'] = short_strike - float(long_leg['strike'])
+                spread_leg['Max Spread Loss ($)'] = matched * 100 * spread_leg['Spread Width']
+
+                if current_stock_price is None:
+                    spread_leg['Delta Numeric'] = pd.NA
+                else:
+                    if delta_key not in delta_cache:
+                        delta_cache[delta_key] = compute_put_delta(
+                            ticker,
+                            expiration,
+                            short_strike,
+                            current_stock_price,
+                            short_row.get('Delta Numeric', pd.NA),
+                        )
+                    spread_leg['Delta Numeric'] = delta_cache[delta_key]
+
+                if pd.isna(spread_leg['Delta Numeric']) or pd.isna(stock_day_change):
+                    spread_leg['Est Position Day Change'] = pd.NA
+                else:
+                    spread_leg['Est Position Day Change'] = (
+                        abs(float(spread_leg['Delta Numeric'])) * float(stock_day_change) * matched * 100.0
+                    )
+
+                if current_stock_price is None:
+                    spread_leg['Moneyness Status'] = ''
+                elif short_strike <= current_stock_price:
+                    spread_leg['Moneyness Status'] = 'Out of Money'
+                else:
+                    spread_leg['Moneyness Status'] = 'In the Money'
+
+                original_contracts = abs(float(short_row['Qty']))
+                ratio = matched / original_contracts if original_contracts else 0.0
+                spread_leg['Current Mkt Value'] = clean_numeric(short_row['Mkt Val (Market Value)']) * ratio
+                spread_leg['Cash Secured ($)'] = matched * 100 * short_strike
+                spread_rows.append(spread_leg)
+
+    if not spread_rows:
+        columns = list(df_puts.columns) + [
+            'Contracts Sold',
+            'Current Stock Price',
+            'Stock Day Change Numeric',
+            'Delta Numeric',
+            'Est Position Day Change',
+            'Moneyness Status',
+            'Current Mkt Value',
+            'Cash Secured ($)',
+            'Long Strike Price',
+            'Spread Width',
+            'Max Spread Loss ($)',
+        ]
+        return pd.DataFrame(columns=columns)
+
+    return pd.DataFrame(spread_rows)
+
+
 def main():
     parser = argparse.ArgumentParser(description='Find naked short puts and estimate cash-secured requirement')
     parser.add_argument('--file', default=None, help='Path to holdings CSV (default: my_holdings.csv next to script)')
@@ -390,6 +484,7 @@ def main():
     stock_day_changes = fetch_stock_day_changes(df_puts['Ticker'])
     df_naked_short_puts = find_uncovered_short_puts(df_puts, stock_prices, stock_day_changes)
     df_all_short_puts = find_all_short_puts(df_puts, stock_prices, stock_day_changes)
+    df_put_spreads = find_put_spread_short_legs(df_puts, stock_prices, stock_day_changes)
 
     output_cols = [
         'Ticker',
@@ -405,6 +500,12 @@ def main():
         'Cash Secured ($)',
     ]
     df_out = df_naked_short_puts[output_cols].copy()
+    spread_output_cols = output_cols + [
+        'Long Strike Price',
+        'Spread Width',
+        'Max Spread Loss ($)',
+    ]
+    df_spread_out = df_put_spreads[spread_output_cols].copy()
 
     total_row = pd.DataFrame([
         {
@@ -433,13 +534,39 @@ def main():
     grand_mkt = df_naked_short_puts['Current Mkt Value'].sum()
     grand_cash_with_spreads = df_all_short_puts['Cash Secured ($)'].sum()
     grand_mkt_with_spreads = df_all_short_puts['Current Mkt Value'].sum()
+    spread_cash = df_put_spreads['Cash Secured ($)'].sum()
+    spread_mkt = df_put_spreads['Current Mkt Value'].sum()
 
     print(f'\nSuccess! Data exported to Excel file: {output_path}')
-    print('\n--- EXCEL CONTENTS ---')
+    print('\n--- NAKED SHORT PUTS ---')
     print(format_display_table(df_out))
+    print('\n--- PUT SPREAD SHORT LEGS ---')
+    if df_spread_out.empty:
+        print('No put spreads found.')
+    else:
+        print(
+            df_spread_out.rename(
+                columns={
+                    'Contracts Sold': 'Qty',
+                    'Strike Price': 'Short Strike',
+                    'Current Stock Price': 'Stock Px',
+                    'Stock Day Change Numeric': 'Stock Day Chg',
+                    'Delta Numeric': 'Delta',
+                    'Est Position Day Change': 'Est Pos Day Chg',
+                    'Moneyness Status': 'Status',
+                    'Current Mkt Value': 'Mkt Value',
+                    'Cash Secured ($)': 'Short Cash Sec',
+                    'Long Strike Price': 'Long Strike',
+                    'Spread Width': 'Width',
+                    'Max Spread Loss ($)': 'Max Spread Loss',
+                }
+            ).to_string(index=False)
+        )
     print('\n--- GRAND TOTALS ---')
     print(f'Total Cash Secured (Naked Only): ${grand_cash:,.2f}')
     print(f'Total Current Liability (Naked Only): ${grand_mkt:,.2f}')
+    print(f'Total Short Put Exposure In Spreads: ${spread_cash:,.2f}')
+    print(f'Total Current Liability In Spread Shorts: ${spread_mkt:,.2f}')
     print(f'Total Cash Secured (Including Spread Shorts): ${grand_cash_with_spreads:,.2f}')
     print(f'Total Current Liability (Including Spread Shorts): ${grand_mkt_with_spreads:,.2f}\n')
 
