@@ -294,6 +294,71 @@ def find_uncovered_short_puts(df_puts, stock_prices, stock_day_changes):
     return pd.DataFrame(uncovered_rows)
 
 
+def find_all_short_puts(df_puts, stock_prices, stock_day_changes):
+    short_rows = []
+    delta_cache = {}
+
+    for _, short_row in df_puts[df_puts['Qty'].astype(float) < 0].iterrows():
+        contracts_sold = abs(float(short_row['Qty']))
+        short_put = short_row.copy()
+        ticker = str(short_row['Ticker']).strip().upper()
+        strike = float(short_row['Strike Price'])
+        expiration = short_row['Expiration']
+        current_stock_price = stock_prices.get(ticker)
+        stock_day_change = stock_day_changes.get(ticker, pd.NA)
+        delta_key = (ticker, expiration, strike)
+
+        short_put['Contracts Sold'] = contracts_sold
+        short_put['Current Stock Price'] = current_stock_price
+        short_put['Stock Day Change Numeric'] = stock_day_change
+
+        if current_stock_price is None:
+            short_put['Delta Numeric'] = pd.NA
+        else:
+            if delta_key not in delta_cache:
+                delta_cache[delta_key] = compute_put_delta(
+                    ticker,
+                    expiration,
+                    strike,
+                    current_stock_price,
+                    short_row.get('Delta Numeric', pd.NA),
+                )
+            short_put['Delta Numeric'] = delta_cache[delta_key]
+
+        if pd.isna(short_put['Delta Numeric']) or pd.isna(stock_day_change):
+            short_put['Est Position Day Change'] = pd.NA
+        else:
+            short_put['Est Position Day Change'] = (
+                abs(float(short_put['Delta Numeric'])) * float(stock_day_change) * contracts_sold * 100.0
+            )
+
+        if current_stock_price is None:
+            short_put['Moneyness Status'] = ''
+        elif strike <= current_stock_price:
+            short_put['Moneyness Status'] = 'Out of Money'
+        else:
+            short_put['Moneyness Status'] = 'In the Money'
+
+        short_put['Current Mkt Value'] = clean_numeric(short_row['Mkt Val (Market Value)'])
+        short_put['Cash Secured ($)'] = contracts_sold * 100 * strike
+        short_rows.append(short_put)
+
+    if not short_rows:
+        columns = list(df_puts.columns) + [
+            'Contracts Sold',
+            'Current Stock Price',
+            'Stock Day Change Numeric',
+            'Delta Numeric',
+            'Est Position Day Change',
+            'Moneyness Status',
+            'Current Mkt Value',
+            'Cash Secured ($)',
+        ]
+        return pd.DataFrame(columns=columns)
+
+    return pd.DataFrame(short_rows)
+
+
 def main():
     parser = argparse.ArgumentParser(description='Find naked short puts and estimate cash-secured requirement')
     parser.add_argument('--file', default=None, help='Path to holdings CSV (default: my_holdings.csv next to script)')
@@ -324,6 +389,7 @@ def main():
     stock_prices = fetch_current_stock_prices(df_puts['Ticker'])
     stock_day_changes = fetch_stock_day_changes(df_puts['Ticker'])
     df_naked_short_puts = find_uncovered_short_puts(df_puts, stock_prices, stock_day_changes)
+    df_all_short_puts = find_all_short_puts(df_puts, stock_prices, stock_day_changes)
 
     output_cols = [
         'Ticker',
@@ -365,13 +431,17 @@ def main():
 
     grand_cash = df_naked_short_puts['Cash Secured ($)'].sum()
     grand_mkt = df_naked_short_puts['Current Mkt Value'].sum()
+    grand_cash_with_spreads = df_all_short_puts['Cash Secured ($)'].sum()
+    grand_mkt_with_spreads = df_all_short_puts['Current Mkt Value'].sum()
 
     print(f'\nSuccess! Data exported to Excel file: {output_path}')
     print('\n--- EXCEL CONTENTS ---')
     print(format_display_table(df_out))
     print('\n--- GRAND TOTALS ---')
-    print(f'Total Cash Secured: ${grand_cash:,.2f}')
-    print(f'Total Current Liability (Mkt Value): ${grand_mkt:,.2f}\n')
+    print(f'Total Cash Secured (Naked Only): ${grand_cash:,.2f}')
+    print(f'Total Current Liability (Naked Only): ${grand_mkt:,.2f}')
+    print(f'Total Cash Secured (Including Spread Shorts): ${grand_cash_with_spreads:,.2f}')
+    print(f'Total Current Liability (Including Spread Shorts): ${grand_mkt_with_spreads:,.2f}\n')
 
 
 if __name__ == '__main__':
