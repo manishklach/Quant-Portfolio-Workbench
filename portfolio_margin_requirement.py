@@ -5,19 +5,18 @@ Estimate portfolio margin/collateral requirement from a Schwab holdings CSV.
 This is a transparent approximation tool, not a broker-exact house margin engine.
 
 Default behavior:
-  - long cash / money market / fixed-income positions: 0 incremental requirement
-  - long equities / ETFs: 0 incremental requirement unless --include-long-regt is used
-  - long options: 0 incremental requirement
-  - covered calls: 0 incremental requirement
-  - naked short puts/calls: Reg-T style estimate using current underlying price
-  - defined-risk short verticals: width * contracts * 100 (conservative max-loss style)
-  - short stock: 150% of short market value
+  - puts only: naked short puts + short put spreads
+
+Optional wider views:
+  - --include-calls adds naked short calls + short call spreads
+  - --full also adds long-security Reg-T / short stock style rows
 
 Examples:
   python portfolio_margin_requirement.py
   python portfolio_margin_requirement.py --file my_holdings.csv
   python portfolio_margin_requirement.py --ticker SOXL
-  python portfolio_margin_requirement.py --include-long-regt
+  python portfolio_margin_requirement.py --include-calls
+  python portfolio_margin_requirement.py --full --include-long-regt
 """
 
 from __future__ import annotations
@@ -185,7 +184,7 @@ def match_verticals(group_rows):
     return matched, leftovers
 
 
-def estimate_margin(df, include_long_regt=False, ticker_filter=None):
+def estimate_margin(df, include_long_regt=False, ticker_filter=None, include_calls=False, include_full=False):
     df = df.copy()
     if ticker_filter:
         ticker_filter = ticker_filter.strip().upper()
@@ -206,38 +205,39 @@ def estimate_margin(df, include_long_regt=False, ticker_filter=None):
 
     rows = []
 
-    for _, row in df_non_options.iterrows():
-        symbol = str(row.get("Symbol", "")).strip().upper()
-        qty = float(row.get("Qty", 0.0))
-        market_value = clean_numeric(row.get("Mkt Val (Market Value)", 0.0))
-        asset_type = str(row.get("Asset Type Normalized", "")).strip()
+    if include_full:
+        for _, row in df_non_options.iterrows():
+            symbol = str(row.get("Symbol", "")).strip().upper()
+            qty = float(row.get("Qty", 0.0))
+            market_value = clean_numeric(row.get("Mkt Val (Market Value)", 0.0))
+            asset_type = str(row.get("Asset Type Normalized", "")).strip()
 
-        if qty > 0:
-            requirement, note = classify_long_security_requirement(row, include_long_regt)
-            if requirement is None:
-                continue
-            rows.append(
-                {
-                    "ticker": symbol,
-                    "category": "long_security",
-                    "detail": asset_type or "Long security",
-                    "quantity": qty,
-                    "requirement": float(requirement),
-                    "note": note,
-                }
-            )
-        elif qty < 0:
-            requirement = 1.50 * abs(market_value)
-            rows.append(
-                {
-                    "ticker": symbol,
-                    "category": "short_security",
-                    "detail": asset_type or "Short security",
-                    "quantity": qty,
-                    "requirement": requirement,
-                    "note": "Estimated short stock margin = 150% of short market value",
-                }
-            )
+            if qty > 0:
+                requirement, note = classify_long_security_requirement(row, include_long_regt)
+                if requirement is None:
+                    continue
+                rows.append(
+                    {
+                        "ticker": symbol,
+                        "category": "long_security",
+                        "detail": asset_type or "Long security",
+                        "quantity": qty,
+                        "requirement": float(requirement),
+                        "note": note,
+                    }
+                )
+            elif qty < 0:
+                requirement = 1.50 * abs(market_value)
+                rows.append(
+                    {
+                        "ticker": symbol,
+                        "category": "short_security",
+                        "detail": asset_type or "Short security",
+                        "quantity": qty,
+                        "requirement": requirement,
+                        "note": "Estimated short stock margin = 150% of short market value",
+                    }
+                )
 
     grouped = split_options(df_options)
     for (underlying, expiration, opt_type), group_rows in grouped.items():
@@ -257,6 +257,8 @@ def estimate_margin(df, include_long_regt=False, ticker_filter=None):
                 category = "short_put_spread"
                 detail = f"{short_strike:g}/{long_strike:g} P {expiration}"
             elif opt_type == "C" and short_strike < long_strike:
+                if not include_calls:
+                    continue
                 requirement = width * contracts * 100.0
                 note = "Defined-risk short call spread; conservative width-based requirement"
                 category = "short_call_spread"
@@ -268,6 +270,8 @@ def estimate_margin(df, include_long_regt=False, ticker_filter=None):
                 if opt_type == "P":
                     detail = f"{long_strike:g}/{short_strike:g} P {expiration}"
                 else:
+                    if not include_full:
+                        continue
                     detail = f"{long_strike:g}/{short_strike:g} C {expiration}"
 
             rows.append(
@@ -296,6 +300,8 @@ def estimate_margin(df, include_long_regt=False, ticker_filter=None):
                 note = "Estimated naked short put Reg-T requirement"
                 category = "naked_short_put"
             else:
+                if not include_calls:
+                    continue
                 covered_shares = share_coverage.get(underlying, 0.0)
                 covered_contracts = min(contracts, covered_shares // 100)
                 uncovered_contracts = contracts - covered_contracts
@@ -342,13 +348,21 @@ def main():
     parser = argparse.ArgumentParser(description="Estimate portfolio margin requirement from a Schwab holdings CSV")
     parser.add_argument("--file", default=None, help="Path to holdings CSV (default: my_holdings.csv next to script)")
     parser.add_argument("--ticker", default=None, help="Optional underlying ticker filter (e.g. SOXL)")
+    parser.add_argument("--include-calls", action="store_true", help="Include naked short calls and short call spreads in the estimate")
+    parser.add_argument("--full", action="store_true", help="Include long-security and short-security margin-style rows in addition to option collateral")
     parser.add_argument("--include-long-regt", action="store_true", help="Include 50% Reg-T initial margin for long equity/ETF positions")
     parser.add_argument("--output-csv", default=None, help="Optional path to write detailed rows as CSV")
     args = parser.parse_args()
 
     csv_path = default_csv_path(args.file, __file__)
     df = load_schwab_holdings(csv_path)
-    details, summary = estimate_margin(df, include_long_regt=args.include_long_regt, ticker_filter=args.ticker)
+    details, summary = estimate_margin(
+        df,
+        include_long_regt=args.include_long_regt,
+        ticker_filter=args.ticker,
+        include_calls=args.include_calls,
+        include_full=args.full,
+    )
 
     print("\nESTIMATED PORTFOLIO MARGIN REQUIREMENT")
     print("=" * 72)
@@ -357,11 +371,15 @@ def main():
         print(f"Ticker filter: {args.ticker.strip().upper()}")
 
     print("\nAssumptions:")
-    print("  Long cash, money market, fixed income, and long options are treated as 0 incremental margin by default.")
+    print("  Default view includes only naked short puts and short put spreads.")
     print("  Short vertical spreads use conservative width-based max-loss requirement.")
-    print("  Naked short options use a Reg-T style estimate based on the current underlying price.")
-    print("  Covered calls are treated as 0 incremental margin when shares cover the short contracts.")
-    if args.include_long_regt:
+    print("  Naked short puts use a Reg-T style estimate based on the current underlying price.")
+    if args.include_calls:
+        print("  Naked short calls and short call spreads are included.")
+        print("  Covered calls are treated as 0 incremental margin when shares cover the short contracts.")
+    if args.full:
+        print("  Full mode includes long cash, money market, fixed income, equity/ETF, and short stock rows.")
+    if args.include_long_regt and args.full:
         print("  Long equities and ETFs include a 50% Reg-T initial margin estimate.")
 
     if details.empty:
