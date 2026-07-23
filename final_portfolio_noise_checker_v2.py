@@ -19,10 +19,18 @@ CALL SPREADS:
     - net spread day P/L < 0
 
 PUTS:
-  Check only:
-    - short puts
+  NAKED short puts:
+    - uncovered short puts only
     - stock price > put strike
   Expected P/L = abs(put_delta) * stock_change * contracts * 100
+
+PUT SPREADS:
+  Flag only:
+    - short higher-strike put + long lower-strike put
+    - same ticker + same expiration
+    - stock price > short put strike
+    - stock day change > 0
+    - net spread day P/L < net-delta expectation
 
 Delta:
   - uses CSV/broker Delta column if present
@@ -248,6 +256,12 @@ def call_spread_intrinsic(S, lower, upper, contracts):
     return v * contracts * 100
 
 
+def long_put_spread_intrinsic(S, lower, upper, contracts):
+    v = max(upper - S, 0) - max(lower - S, 0)
+    v = max(0, min(v, upper - lower))
+    return v * contracts * 100
+
+
 def find_bad_itm_upday_call_spreads(options, quotes):
     calls = options[options["option_type"] == "CALL"].copy()
     qmap = quotes.set_index("ticker").to_dict("index")
@@ -267,6 +281,7 @@ def find_bad_itm_upday_call_spreads(options, quotes):
                 "remaining_qty": int(abs(row["quantity"])),
                 "original_qty": int(abs(row["quantity"])),
                 "day_pl": float(row["day_pl"]),
+                "row": row.copy(),
             }
             for _, row in g[g["quantity"] > 0].sort_values("strike").iterrows()
         ]
@@ -324,6 +339,69 @@ def find_bad_itm_upday_call_spreads(options, quotes):
     if not out.empty:
         out = out.sort_values("diff_to_add_back", ascending=False)
     return out
+
+
+def split_short_puts_and_spreads(options):
+    puts = options[options["option_type"] == "PUT"].copy()
+    naked_rows = []
+    spread_rows = []
+
+    for (ticker, exp), g in puts.groupby(["ticker", "expiration"], dropna=False):
+        longs = [
+            {
+                "strike": float(row["strike"]),
+                "remaining_qty": int(abs(row["quantity"])),
+                "original_qty": int(abs(row["quantity"])),
+                "day_pl": float(row["day_pl"]),
+                "row": row.copy(),
+            }
+            for _, row in g[g["quantity"] > 0].sort_values("strike").iterrows()
+        ]
+        shorts = [
+            {
+                "row": row.copy(),
+                "strike": float(row["strike"]),
+                "remaining_qty": int(abs(row["quantity"])),
+                "original_qty": int(abs(row["quantity"])),
+                "day_pl": float(row["day_pl"]),
+            }
+            for _, row in g[g["quantity"] < 0].sort_values("strike", ascending=False).iterrows()
+        ]
+
+        for short_leg in shorts:
+            short_strike = short_leg["strike"]
+            remaining_short = short_leg["remaining_qty"]
+            candidates = [leg for leg in longs if leg["remaining_qty"] > 0 and leg["strike"] < short_strike]
+            candidates.sort(key=lambda leg: leg["strike"], reverse=True)
+
+            for long_leg in candidates:
+                if remaining_short <= 0:
+                    break
+
+                contracts = min(long_leg["remaining_qty"], remaining_short)
+                if contracts <= 0:
+                    continue
+
+                matched_row = short_leg["row"].copy()
+                matched_row["contracts"] = contracts
+                matched_row["long_strike"] = float(long_leg["strike"])
+                matched_row["long_day_pl"] = long_leg["day_pl"] * contracts / max(long_leg["original_qty"], 1)
+                matched_row["short_day_pl"] = short_leg["day_pl"] * contracts / max(short_leg["original_qty"], 1)
+                matched_row["long_csv_delta"] = long_leg["row"].get("csv_delta", np.nan)
+                matched_row["long_price"] = long_leg["row"].get("price", np.nan)
+                spread_rows.append(matched_row)
+
+                long_leg["remaining_qty"] -= contracts
+                remaining_short -= contracts
+
+            if remaining_short > 0:
+                naked_row = short_leg["row"].copy()
+                ratio = remaining_short / max(short_leg["original_qty"], 1)
+                naked_row["quantity"] = -remaining_short
+                naked_row["day_pl"] = short_leg["day_pl"] * ratio
+                naked_rows.append(naked_row)
+
+    return pd.DataFrame(naked_rows), pd.DataFrame(spread_rows)
 
 
 def norm_cdf(x):
@@ -423,8 +501,8 @@ def fetch_yf_iv_for_put(ticker, expiration, strike):
         return np.nan, None, f"yf_error_{e}"
 
 
-def check_otm_short_puts(options, quotes, risk_free_rate=0.045, dividend_yield=0.0, prefer_csv_delta=True):
-    puts = options[(options["option_type"] == "PUT") & (options["quantity"] < 0)].copy()
+def check_otm_short_puts(puts, quotes, risk_free_rate=0.045, dividend_yield=0.0, prefer_csv_delta=True):
+    puts = puts.copy()
     qmap = quotes.set_index("ticker").to_dict("index")
     rows = []
     iv_cache = {}
@@ -506,6 +584,132 @@ def check_otm_short_puts(options, quotes, risk_free_rate=0.045, dividend_yield=0
     return out
 
 
+def resolve_put_delta(ticker, expiration, strike, spot, csv_delta=np.nan, option_mark=np.nan, risk_free_rate=0.045, dividend_yield=0.0, prefer_csv_delta=True, iv_cache=None):
+    delta = np.nan
+    delta_source = None
+    yf_iv = np.nan
+    matched_exp = None
+    yf_note = None
+
+    if prefer_csv_delta and not pd.isna(csv_delta):
+        delta = normalize_put_delta(csv_delta)
+        delta_source = "csv/broker_delta"
+
+    if pd.isna(delta):
+        T = year_frac(expiration)
+        mark_iv = implied_volatility_from_price(
+            float(option_mark) if not pd.isna(option_mark) else np.nan,
+            spot,
+            strike,
+            T,
+            risk_free_rate,
+            "P",
+            dividend_yield,
+        )
+        if not pd.isna(mark_iv):
+            delta = bs_put_delta(spot, strike, T, risk_free_rate, mark_iv, dividend_yield)
+            delta_source = "mark_iv_black_scholes"
+
+    if pd.isna(delta):
+        key = (ticker, expiration, strike)
+        if iv_cache is not None and key in iv_cache:
+            yf_iv, matched_exp, yf_note = iv_cache[key]
+        else:
+            yf_iv, matched_exp, yf_note = fetch_yf_iv_for_put(ticker, expiration, strike)
+            if iv_cache is not None:
+                iv_cache[key] = (yf_iv, matched_exp, yf_note)
+        T = year_frac(matched_exp or expiration)
+        delta = bs_put_delta(spot, strike, T, risk_free_rate, yf_iv, dividend_yield)
+        delta_source = "yf_iv_black_scholes"
+
+    return {
+        "delta": delta,
+        "delta_source": delta_source,
+        "yf_iv": yf_iv,
+        "yf_matched_expiration": matched_exp,
+        "yf_note": yf_note,
+    }
+
+
+def check_otm_put_spreads(spreads, quotes, risk_free_rate=0.045, dividend_yield=0.0, prefer_csv_delta=True):
+    spreads = spreads.copy()
+    qmap = quotes.set_index("ticker").to_dict("index")
+    rows = []
+    iv_cache = {}
+
+    for _, row in spreads.iterrows():
+        ticker = row["ticker"]
+        q = qmap.get(ticker)
+        if not q:
+            continue
+
+        last, prev, stock_chg = q.get("last"), q.get("prev_close"), q.get("stock_change")
+        if pd.isna(last) or pd.isna(prev) or pd.isna(stock_chg) or stock_chg <= 0:
+            continue
+
+        short_strike = float(row["strike"])
+        if last <= short_strike:
+            continue
+
+        long_strike = float(row["long_strike"])
+        contracts = int(abs(row["contracts"]))
+        long_day_pl = float(row["long_day_pl"])
+        short_day_pl = float(row["short_day_pl"])
+        actual = long_day_pl + short_day_pl
+        short_delta_info = resolve_put_delta(
+            ticker,
+            row["expiration"],
+            short_strike,
+            float(last),
+            csv_delta=row.get("csv_delta", np.nan),
+            option_mark=row.get("price", np.nan),
+            risk_free_rate=risk_free_rate,
+            dividend_yield=dividend_yield,
+            prefer_csv_delta=prefer_csv_delta,
+            iv_cache=iv_cache,
+        )
+        long_delta_info = resolve_put_delta(
+            ticker,
+            row["expiration"],
+            long_strike,
+            float(last),
+            csv_delta=row.get("long_csv_delta", np.nan),
+            option_mark=row.get("long_price", np.nan),
+            risk_free_rate=risk_free_rate,
+            dividend_yield=dividend_yield,
+            prefer_csv_delta=prefer_csv_delta,
+            iv_cache=iv_cache,
+        )
+        short_abs = abs(short_delta_info["delta"]) if not pd.isna(short_delta_info["delta"]) else np.nan
+        long_abs = abs(long_delta_info["delta"]) if not pd.isna(long_delta_info["delta"]) else np.nan
+        net_delta = np.nan if pd.isna(short_abs) or pd.isna(long_abs) else short_abs - long_abs
+        expected = np.nan if pd.isna(net_delta) else net_delta * stock_chg * contracts * 100
+        diff = expected - actual
+
+        rows.append({
+            "ticker": ticker,
+            "expiration": row["expiration"],
+            "spread": f"{short_strike:g}/{long_strike:g} P",
+            "contracts": contracts,
+            "stock_change": stock_chg,
+            "short_delta_abs": short_abs,
+            "long_delta_abs": long_abs,
+            "net_spread_delta": net_delta,
+            "short_delta_source": short_delta_info["delta_source"],
+            "long_delta_source": long_delta_info["delta_source"],
+            "long_day_pl": long_day_pl,
+            "short_day_pl": short_day_pl,
+            "schwab_net_day_pl": actual,
+            "delta_expected_day_pl": expected,
+            "diff_to_add_back": diff,
+        })
+
+    out = pd.DataFrame(rows)
+    if not out.empty:
+        out = out.sort_values("diff_to_add_back", ascending=False)
+    return out
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("csv")
@@ -521,10 +725,18 @@ def main():
     raw = read_broker_csv(args.csv)
     options = standardize(raw)
     quotes = get_quotes(sorted(options["ticker"].unique()))
+    naked_puts, put_spread_legs = split_short_puts_and_spreads(options)
 
     bad_calls = find_bad_itm_upday_call_spreads(options, quotes)
     puts = check_otm_short_puts(
-        options,
+        naked_puts,
+        quotes,
+        risk_free_rate=args.risk_free_rate,
+        dividend_yield=args.dividend_yield,
+        prefer_csv_delta=(not args.use_yf_delta_only),
+    )
+    put_spreads = check_otm_put_spreads(
+        put_spread_legs,
         quotes,
         risk_free_rate=args.risk_free_rate,
         dividend_yield=args.dividend_yield,
@@ -537,27 +749,36 @@ def main():
     else:
         puts["positive_addback"] = pd.to_numeric(puts["diff_to_add_back"], errors="coerce").clip(lower=0)
         put_addback = float(puts["positive_addback"].fillna(0).sum())
+    if put_spreads.empty:
+        put_spread_addback = 0.0
+    else:
+        put_spreads["positive_addback"] = pd.to_numeric(put_spreads["diff_to_add_back"], errors="coerce").clip(lower=0)
+        put_spread_addback = float(put_spreads["positive_addback"].fillna(0).sum())
 
-    total = call_addback + put_addback
+    total = call_addback + put_addback + put_spread_addback
     summary = pd.DataFrame([
         {"bucket": "Bad ITM up-day call spreads", "count": len(bad_calls), "addback": call_addback},
-        {"bucket": "OTM short puts delta check", "count": len(puts), "addback": put_addback},
-        {"bucket": "TOTAL", "count": len(bad_calls) + len(puts), "addback": total},
+        {"bucket": "OTM naked short puts delta check", "count": len(puts), "addback": put_addback},
+        {"bucket": "OTM up-day put spreads", "count": len(put_spreads), "addback": put_spread_addback},
+        {"bucket": "TOTAL", "count": len(bad_calls) + len(puts) + len(put_spreads), "addback": total},
     ])
 
     bad_calls_path = outdir / "bad_itm_upday_call_spreads.csv"
     puts_path = outdir / "otm_short_put_delta_check.csv"
+    put_spreads_path = outdir / "otm_upday_put_spreads.csv"
     summary_path = outdir / "final_noise_summary.csv"
     xlsx_path = outdir / "final_portfolio_noise_report.xlsx"
 
     bad_calls.to_csv(bad_calls_path, index=False)
     puts.to_csv(puts_path, index=False)
+    put_spreads.to_csv(put_spreads_path, index=False)
     summary.to_csv(summary_path, index=False)
 
     with pd.ExcelWriter(xlsx_path, engine="openpyxl") as w:
         summary.to_excel(w, index=False, sheet_name="Summary")
         bad_calls.to_excel(w, index=False, sheet_name="Bad ITM Up-Day Calls")
-        puts.to_excel(w, index=False, sheet_name="OTM Short Puts")
+        puts.to_excel(w, index=False, sheet_name="OTM Naked Short Puts")
+        put_spreads.to_excel(w, index=False, sheet_name="OTM Up-Day Put Spreads")
         quotes.to_excel(w, index=False, sheet_name="Quotes")
         options.to_excel(w, index=False, sheet_name="Parsed Options")
 
@@ -574,13 +795,22 @@ def main():
         print(f"\n  Call-spread add-back: ${call_addback:,.2f}")
 
     print("\nSHORT PUT RULE:")
-    print("  OTM short puts only, expected P/L = abs(delta) × stock_change × contracts × 100.")
+    print("  OTM naked short puts only, expected P/L = abs(delta) × stock_change × contracts × 100.")
     if puts.empty:
-        print("  No OTM short puts found.")
+        print("  No OTM naked short puts found.")
     else:
         cols = ["ticker", "expiration", "short_put", "contracts", "stock_change", "delta_used_abs", "delta_source", "schwab_day_pl", "delta_expected_day_pl", "diff_to_add_back"]
         print(puts[cols].to_string(index=False))
         print(f"\n  Short-put positive add-back: ${put_addback:,.2f}")
+
+    print("\nPUT SPREAD RULE:")
+    print("  OTM short put spreads only, stock up, expected P/L = net spread delta x stock_change x contracts x 100.")
+    if put_spreads.empty:
+        print("  No OTM up-day put spreads found.")
+    else:
+        cols = ["ticker", "expiration", "spread", "contracts", "stock_change", "short_delta_abs", "long_delta_abs", "net_spread_delta", "schwab_net_day_pl", "delta_expected_day_pl", "diff_to_add_back"]
+        print(put_spreads[cols].to_string(index=False))
+        print(f"\n  Put-spread positive add-back: ${put_spread_addback:,.2f}")
 
     print("\nSUMMARY")
     print(summary.to_string(index=False))
@@ -589,6 +819,7 @@ def main():
     print("\nFiles written:")
     print(f"  {bad_calls_path}")
     print(f"  {puts_path}")
+    print(f"  {put_spreads_path}")
     print(f"  {summary_path}")
     print(f"  {xlsx_path}")
 
