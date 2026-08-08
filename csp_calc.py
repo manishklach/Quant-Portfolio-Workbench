@@ -1,8 +1,7 @@
-"""Estimate uncovered short put exposure and cash-secured capital required from a Schwab holdings export."""
+"""Estimate naked short put reserve needs and defined-risk put spread exposure."""
 
 import argparse
 import math
-import random
 from datetime import datetime, timezone
 
 import pandas as pd
@@ -17,18 +16,6 @@ except ImportError:
 
 rISK_FREE_RATE = 0.045
 DIVIDEND_YIELD = 0.0
-
-
-FUNNY_STARTUP_MESSAGES = [
-    'Warming up the cash-secured put microscope...',
-    'Counting naked puts and pretending this is cardio...',
-    'Summoning spreadsheet goblins for moneyness inspection...',
-    'Peeking under the hood for put-shaped surprises...',
-    'Running the premium-powered danger scanner...',
-    'Consulting the highly paid committee of suspicious spreadsheets...',
-    'Measuring how spicy these short puts really are...',
-    'Politely asking the options chain to explain itself...',
-]
 
 
 def norm_cdf(x):
@@ -180,12 +167,12 @@ def fetch_stock_day_changes(tickers):
 
 def autosize_excel_columns(output_path):
     workbook = load_workbook(output_path)
-    worksheet = workbook.active
 
-    for column_cells in worksheet.columns:
-        column_letter = column_cells[0].column_letter
-        max_length = max(len(str(cell.value or '')) for cell in column_cells)
-        worksheet.column_dimensions[column_letter].width = min(max(max_length + 2, 10), 18)
+    for worksheet in workbook.worksheets:
+        for column_cells in worksheet.columns:
+            column_letter = column_cells[0].column_letter
+            max_length = max(len(str(cell.value or '')) for cell in column_cells)
+            worksheet.column_dimensions[column_letter].width = min(max(max_length + 2, 10), 22)
 
     workbook.save(output_path)
 
@@ -202,6 +189,27 @@ def format_display_table(df_out):
             'Moneyness Status': 'Status',
             'Current Mkt Value': 'Mkt Value',
             'Cash Secured ($)': 'Cash Sec',
+        }
+    ).copy()
+
+    return display_df.to_string(index=False)
+
+
+def format_spread_display_table(df_out):
+    display_df = df_out.rename(
+        columns={
+            'Contracts Sold': 'Qty',
+            'Strike Price': 'Short Strike',
+            'Current Stock Price': 'Stock Px',
+            'Stock Day Change Numeric': 'Stock Day Chg',
+            'Delta Numeric': 'Delta',
+            'Est Position Day Change': 'Est Pos Day Chg',
+            'Moneyness Status': 'Status',
+            'Current Mkt Value': 'Short Mkt Value',
+            'Cash Secured ($)': 'Short Notional',
+            'Long Strike Price': 'Long Strike',
+            'Spread Width': 'Width',
+            'Max Spread Loss ($)': 'Max Spread Loss',
         }
     ).copy()
 
@@ -454,9 +462,15 @@ def find_put_spread_short_legs(df_puts, stock_prices, stock_day_changes):
 
 
 def main():
-    parser = argparse.ArgumentParser(description='Find naked short puts and estimate cash-secured requirement')
+    parser = argparse.ArgumentParser(
+        description='Review naked short puts and defined-risk put spreads from a Schwab holdings export.'
+    )
     parser.add_argument('--file', default=None, help='Path to holdings CSV (default: my_holdings.csv next to script)')
-    parser.add_argument('--output', default=None, help='Output Excel path (default: naked_short_puts.xlsx next to script)')
+    parser.add_argument(
+        '--output',
+        default=None,
+        help='Output Excel path (default: naked_short_puts.xlsx next to script)',
+    )
     parser.add_argument('--ticker', default=None, help='Filter to a specific ticker (e.g. MU)')
     args = parser.parse_args()
 
@@ -467,7 +481,7 @@ def main():
         else default_csv_path(args.output, __file__)
     )
 
-    print(f'\n{random.choice(FUNNY_STARTUP_MESSAGES)}\n')
+    print('\nReviewing short put exposure from holdings...\n')
 
     df = load_schwab_holdings(csv_path)
     df_options = active_option_positions(df)
@@ -527,48 +541,90 @@ def main():
     else:
         df_out = pd.concat([df_out, total_row], ignore_index=True)
 
-    df_out.to_excel(output_path, index=False)
+    summary_rows = pd.DataFrame(
+        [
+            {
+                'Section': 'Naked short puts',
+                'Metric': 'Cash-secured assignment reserve',
+                'Value': df_naked_short_puts['Cash Secured ($)'].sum(),
+                'Notes': 'Strike x 100 x contracts for uncovered short puts only.',
+            },
+            {
+                'Section': 'Naked short puts',
+                'Metric': 'Current marked liability',
+                'Value': df_naked_short_puts['Current Mkt Value'].sum(),
+                'Notes': 'Current market value of uncovered short put legs.',
+            },
+            {
+                'Section': 'Put spreads',
+                'Metric': 'Short-strike notional reference',
+                'Value': df_put_spreads['Cash Secured ($)'].sum(),
+                'Notes': 'Reference only. This is not the collateral requirement for a defined-risk spread.',
+            },
+            {
+                'Section': 'Put spreads',
+                'Metric': 'Defined-risk max loss',
+                'Value': df_put_spreads['Max Spread Loss ($)'].sum(),
+                'Notes': 'Spread width x 100 x contracts.',
+            },
+            {
+                'Section': 'Put spreads',
+                'Metric': 'Current marked liability on short legs',
+                'Value': df_put_spreads['Current Mkt Value'].sum(),
+                'Notes': 'Current market value of the short put leg(s) inside spreads.',
+            },
+            {
+                'Section': 'Combined',
+                'Metric': 'Naked reserve + spread max loss',
+                'Value': df_naked_short_puts['Cash Secured ($)'].sum() + df_put_spreads['Max Spread Loss ($)'].sum(),
+                'Notes': 'Simple worst-case capital framing: naked assignment reserve plus PCS max loss.',
+            },
+        ]
+    )
+
+    with pd.ExcelWriter(output_path, engine='openpyxl') as writer:
+        df_out.to_excel(writer, sheet_name='Naked Short Puts', index=False)
+        df_spread_out.to_excel(writer, sheet_name='Put Spread Shorts', index=False)
+        summary_rows.to_excel(writer, sheet_name='Summary', index=False)
     autosize_excel_columns(output_path)
 
     grand_cash = df_naked_short_puts['Cash Secured ($)'].sum()
     grand_mkt = df_naked_short_puts['Current Mkt Value'].sum()
     grand_cash_with_spreads = df_all_short_puts['Cash Secured ($)'].sum()
     grand_mkt_with_spreads = df_all_short_puts['Current Mkt Value'].sum()
-    spread_cash = df_put_spreads['Cash Secured ($)'].sum()
+    spread_short_notional = df_put_spreads['Cash Secured ($)'].sum()
     spread_mkt = df_put_spreads['Current Mkt Value'].sum()
+    spread_max_loss = df_put_spreads['Max Spread Loss ($)'].sum()
+    missing_prices = int(df_all_short_puts['Current Stock Price'].isna().sum())
+    missing_day_change = int(df_all_short_puts['Stock Day Change Numeric'].isna().sum())
 
-    print(f'\nSuccess! Data exported to Excel file: {output_path}')
+    print(f'\nExport complete: {output_path}')
+    print('Workbook tabs: Naked Short Puts, Put Spread Shorts, Summary')
+    if args.ticker:
+        print(f'Ticker filter applied: {args.ticker.strip().upper()}')
     print('\n--- NAKED SHORT PUTS ---')
     print(format_display_table(df_out))
     print('\n--- PUT SPREAD SHORT LEGS ---')
     if df_spread_out.empty:
         print('No put spreads found.')
     else:
-        print(
-            df_spread_out.rename(
-                columns={
-                    'Contracts Sold': 'Qty',
-                    'Strike Price': 'Short Strike',
-                    'Current Stock Price': 'Stock Px',
-                    'Stock Day Change Numeric': 'Stock Day Chg',
-                    'Delta Numeric': 'Delta',
-                    'Est Position Day Change': 'Est Pos Day Chg',
-                    'Moneyness Status': 'Status',
-                    'Current Mkt Value': 'Mkt Value',
-                    'Cash Secured ($)': 'Short Cash Sec',
-                    'Long Strike Price': 'Long Strike',
-                    'Spread Width': 'Width',
-                    'Max Spread Loss ($)': 'Max Spread Loss',
-                }
-            ).to_string(index=False)
-        )
+        print(format_spread_display_table(df_spread_out))
     print('\n--- GRAND TOTALS ---')
-    print(f'Total Cash Secured (Naked Only): ${grand_cash:,.2f}')
-    print(f'Total Current Liability (Naked Only): ${grand_mkt:,.2f}')
-    print(f'Total Short Put Exposure In Spreads: ${spread_cash:,.2f}')
-    print(f'Total Current Liability In Spread Shorts: ${spread_mkt:,.2f}')
-    print(f'Total Cash Secured (Including Spread Shorts): ${grand_cash_with_spreads:,.2f}')
-    print(f'Total Current Liability (Including Spread Shorts): ${grand_mkt_with_spreads:,.2f}\n')
+    print(f'Naked short puts: cash-secured assignment reserve = ${grand_cash:,.2f}')
+    print(f'Naked short puts: current marked liability = ${grand_mkt:,.2f}')
+    print(f'Put spreads: short-strike notional reference = ${spread_short_notional:,.2f}')
+    print(f'Put spreads: defined-risk max loss = ${spread_max_loss:,.2f}')
+    print(f'Put spreads: current marked liability on short legs = ${spread_mkt:,.2f}')
+    print(f'All short puts combined: short-strike notional reference = ${grand_cash_with_spreads:,.2f}')
+    print(f'All short puts combined: current marked liability = ${grand_mkt_with_spreads:,.2f}')
+    print(f'Simple combined capital framing = naked reserve + spread max loss = ${grand_cash + spread_max_loss:,.2f}')
+    if missing_prices or missing_day_change:
+        print('\n--- DATA QUALITY NOTES ---')
+        if missing_prices:
+            print(f'Missing current stock price for {missing_prices} short put row(s); delta and moneyness may be blank there.')
+        if missing_day_change:
+            print(f'Missing stock day change for {missing_day_change} short put row(s); estimated position day change may be blank there.')
+    print()
 
 
 if __name__ == '__main__':
