@@ -208,8 +208,13 @@ def format_spread_display_table(df_out):
             'Current Mkt Value': 'Short Mkt Value',
             'Cash Secured ($)': 'Short Notional',
             'Long Strike Price': 'Long Strike',
+            'Long Current Mkt Value': 'Long Mkt Value',
             'Spread Width': 'Width',
             'Max Spread Loss ($)': 'Max Spread Loss',
+            'Premium Collected ($)': 'Premium Collected',
+            'Net Max Loss After Credit ($)': 'Net Max Loss',
+            'Net Spread Mkt Value': 'Net Spread Mkt',
+            'Net Spread Day Change': 'Spread Day Chg',
         }
     ).copy()
 
@@ -438,7 +443,26 @@ def find_put_spread_short_legs(df_puts, stock_prices, stock_day_changes):
 
                 original_contracts = abs(float(short_row['Qty']))
                 ratio = matched / original_contracts if original_contracts else 0.0
-                spread_leg['Current Mkt Value'] = clean_numeric(short_row['Mkt Val (Market Value)']) * ratio
+                long_original_contracts = abs(float(long_leg['row']['Qty']))
+                long_ratio = matched / long_original_contracts if long_original_contracts else 0.0
+                short_day_change = clean_numeric(short_row.get('Day Chng $ (Day Change $)', 0.0)) * ratio
+                long_day_change = clean_numeric(long_leg['row'].get('Day Chng $ (Day Change $)', 0.0)) * long_ratio
+                short_current_mkt_value = clean_numeric(short_row['Mkt Val (Market Value)']) * ratio
+                long_current_mkt_value = clean_numeric(long_leg['row']['Mkt Val (Market Value)']) * long_ratio
+                short_cost_basis = clean_numeric(short_row.get('Cost Basis', 0.0)) * ratio
+                long_cost_basis = clean_numeric(long_leg['row'].get('Cost Basis', 0.0)) * long_ratio
+                net_cost_basis = short_cost_basis + long_cost_basis
+                premium_collected = max(-net_cost_basis, 0.0)
+                net_max_loss_after_credit = max(spread_leg['Max Spread Loss ($)'] - premium_collected, 0.0)
+
+                spread_leg['Current Mkt Value'] = short_current_mkt_value
+                spread_leg['Long Current Mkt Value'] = long_current_mkt_value
+                spread_leg['Short Leg Day Change'] = short_day_change
+                spread_leg['Long Leg Day Change'] = long_day_change
+                spread_leg['Premium Collected ($)'] = premium_collected
+                spread_leg['Net Max Loss After Credit ($)'] = net_max_loss_after_credit
+                spread_leg['Net Spread Day Change'] = short_day_change + long_day_change
+                spread_leg['Net Spread Mkt Value'] = short_current_mkt_value + long_current_mkt_value
                 spread_leg['Cash Secured ($)'] = matched * 100 * short_strike
                 spread_rows.append(spread_leg)
 
@@ -453,8 +477,15 @@ def find_put_spread_short_legs(df_puts, stock_prices, stock_day_changes):
             'Current Mkt Value',
             'Cash Secured ($)',
             'Long Strike Price',
+            'Long Current Mkt Value',
             'Spread Width',
             'Max Spread Loss ($)',
+            'Premium Collected ($)',
+            'Net Max Loss After Credit ($)',
+            'Short Leg Day Change',
+            'Long Leg Day Change',
+            'Net Spread Day Change',
+            'Net Spread Mkt Value',
         ]
         return pd.DataFrame(columns=columns)
 
@@ -516,8 +547,13 @@ def main():
     df_out = df_naked_short_puts[output_cols].copy()
     spread_output_cols = output_cols + [
         'Long Strike Price',
+        'Long Current Mkt Value',
         'Spread Width',
         'Max Spread Loss ($)',
+        'Premium Collected ($)',
+        'Net Max Loss After Credit ($)',
+        'Net Spread Mkt Value',
+        'Net Spread Day Change',
     ]
     df_spread_out = df_put_spreads[spread_output_cols].copy()
 
@@ -569,9 +605,33 @@ def main():
             },
             {
                 'Section': 'Put spreads',
+                'Metric': 'Premium collected',
+                'Value': df_put_spreads['Premium Collected ($)'].sum(),
+                'Notes': 'Estimated original net credit from paired spread cost basis.',
+            },
+            {
+                'Section': 'Put spreads',
+                'Metric': 'Net max loss after credit',
+                'Value': df_put_spreads['Net Max Loss After Credit ($)'].sum(),
+                'Notes': 'Defined-risk max loss minus estimated original premium collected.',
+            },
+            {
+                'Section': 'Put spreads',
                 'Metric': 'Current marked liability on short legs',
                 'Value': df_put_spreads['Current Mkt Value'].sum(),
                 'Notes': 'Current market value of the short put leg(s) inside spreads.',
+            },
+            {
+                'Section': 'Put spreads',
+                'Metric': 'Current net spread mark',
+                'Value': df_put_spreads['Net Spread Mkt Value'].sum(),
+                'Notes': 'Current marked value of the full put spread: short leg plus long leg.',
+            },
+            {
+                'Section': 'Put spreads',
+                'Metric': 'Current spread day change',
+                'Value': df_put_spreads['Net Spread Day Change'].sum(),
+                'Notes': 'Today change of the full put spread: short leg day change plus long leg day change.',
             },
             {
                 'Section': 'Combined',
@@ -594,7 +654,11 @@ def main():
     grand_mkt_with_spreads = df_all_short_puts['Current Mkt Value'].sum()
     spread_short_notional = df_put_spreads['Cash Secured ($)'].sum()
     spread_mkt = df_put_spreads['Current Mkt Value'].sum()
+    spread_net_mkt = df_put_spreads['Net Spread Mkt Value'].sum()
+    spread_day_change = df_put_spreads['Net Spread Day Change'].sum()
     spread_max_loss = df_put_spreads['Max Spread Loss ($)'].sum()
+    spread_premium_collected = df_put_spreads['Premium Collected ($)'].sum()
+    spread_net_max_loss = df_put_spreads['Net Max Loss After Credit ($)'].sum()
     missing_prices = int(df_all_short_puts['Current Stock Price'].isna().sum())
     missing_day_change = int(df_all_short_puts['Stock Day Change Numeric'].isna().sum())
 
@@ -614,7 +678,11 @@ def main():
     print(f'Naked short puts: current marked liability = ${grand_mkt:,.2f}')
     print(f'Put spreads: short-strike notional reference = ${spread_short_notional:,.2f}')
     print(f'Put spreads: defined-risk max loss = ${spread_max_loss:,.2f}')
+    print(f'Put spreads: premium collected = ${spread_premium_collected:,.2f}')
+    print(f'Put spreads: net max loss after credit = ${spread_net_max_loss:,.2f}')
     print(f'Put spreads: current marked liability on short legs = ${spread_mkt:,.2f}')
+    print(f'Put spreads: current net spread mark = ${spread_net_mkt:,.2f}')
+    print(f'Put spreads: current spread day change = ${spread_day_change:,.2f}')
     print(f'All short puts combined: short-strike notional reference = ${grand_cash_with_spreads:,.2f}')
     print(f'All short puts combined: current marked liability = ${grand_mkt_with_spreads:,.2f}')
     print(f'Simple combined capital framing = naked reserve + spread max loss = ${grand_cash + spread_max_loss:,.2f}')
