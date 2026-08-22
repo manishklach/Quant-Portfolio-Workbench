@@ -30,7 +30,7 @@ Optional: override rate and dividend assumptions for the Black-Scholes fallback:
 python.exe .\final_portfolio_noise_checker_v2.py .\my_holdings.csv --risk-free-rate 0.04 --dividend-yield 0.01
 ```
 
-Estimate after-hours portfolio P/L from a Schwab holdings export:
+Estimate after-hours / overnight portfolio P/L from a Schwab holdings export:
 
 ```powershell
 python.exe .\after_hours_portfolio_pnl.py .\my_holdings.csv
@@ -48,6 +48,18 @@ Force the `DRAM` ETF to use a component basket proxy when you want memory-stock 
 python.exe .\after_hours_portfolio_pnl.py .\my_holdings.csv --prefer-etf-proxy
 ```
 
+Show the bullish maximum profit for all open cash-secured puts and put credit spreads. This assumes each underlying closes at or above its short-put strike at expiration, so every short put expires worthless:
+
+```powershell
+python.exe .\csp_calc.py --max
+```
+
+Limit that view to one ticker, for example SOXL:
+
+```powershell
+python.exe .\csp_calc.py --max --ticker SOXL
+```
+
 List currently supported perp-driven price sources for the tickers in your holdings:
 
 ```powershell
@@ -60,10 +72,28 @@ Run the Nasdaq-100 quant model scanner:
 python.exe .\nasdaq100_quant_model.py scan --top 12 --csv .\my_holdings.csv
 ```
 
+Run the live scanner with extended-hours price action blended into the score:
+
+```powershell
+python.exe .\nasdaq100_quant_model.py scan --top 12 --csv .\my_holdings.csv --use-overnight
+```
+
 Run the Nasdaq-100 quant model backtest:
 
 ```powershell
 python.exe .\nasdaq100_quant_model.py backtest --years 5 --top 12
+```
+
+Plan a path from current NAV to a target NAV with strategy sleeves:
+
+```powershell
+python.exe .\portfolio_growth_plan.py --current-nav 20000000 --target-nav 25000000 --end-date 2026-12-31
+```
+
+List built-in strategy presets:
+
+```powershell
+python.exe .\portfolio_growth_plan.py --list-presets
 ```
 
 ## What This Tool Is
@@ -123,6 +153,7 @@ Additional utility:
 
 - `after_hours_portfolio_pnl.py`
 - `nasdaq100_quant_model.py`
+- `portfolio_growth_plan.py`
 
 If other older scripts exist in the repo, treat this file as the intended final noise-checker version unless you are explicitly debugging an older workflow.
 
@@ -151,6 +182,8 @@ Default behavior:
 - use Yahoo `postMarketPrice` when available
 - otherwise use Yahoo `preMarketPrice`
 - otherwise fall back to Coinbase equity perpetual prices for supported names
+
+That means the script already uses overnight-style pricing when the post-market session is over and a pre-market / overnight quote is the best live extended-hours quote available.
 
 Perpetual-futures support:
 
@@ -222,6 +255,7 @@ The position-level CSV produced by `after_hours_portfolio_pnl.py --output ...` i
 - `regular_underlying`
 - `after_hours_underlying`
 - `after_hours_source`
+- `extended_hours_session`
 - `perp_symbol`
 - `perp_index_price`
 - `perp_last_price`
@@ -282,6 +316,32 @@ The current fundamental layer uses:
 
 Because `yfinance` does not consistently expose a true forward price-to-sales field, the model currently uses trailing price-to-sales as the sales-multiple input.
 
+### Overnight Overlay
+
+The live scanner can optionally blend extended-hours price action into the final live rank with:
+
+```powershell
+python.exe .\nasdaq100_quant_model.py scan --use-overnight
+```
+
+The overnight overlay is designed as a live execution layer, not a replacement for the daily model. It:
+
+- uses Yahoo post-market or pre-market quotes when available
+- can prefer Coinbase equity perpetual prices with `--prefer-perp`
+- computes overnight return versus the regular close
+- computes overnight alpha versus `QQQ`
+- adds a capped overnight score that can confirm or fade the base composite rank
+
+The overnight overlay currently adjusts the live score as:
+
+```text
+final_live_score =
+0.85 * base_composite_score
++ 0.15 * overnight_score
+```
+
+This keeps overnight data helpful without letting noisy after-hours prints dominate the model.
+
 ### Market Regime Filter
 
 The model uses `QQQ` as a regime filter. It only flips fully risk-on when:
@@ -297,6 +357,95 @@ If that filter is not satisfied, the scanner shifts to `WAIT` / `REDUCE` / `SELL
 The backtest currently uses the current public Nasdaq-100 constituent list, not a point-in-time historical membership database. That means the backtest has survivorship bias and should be treated as a research tool, not a production-grade historical result.
 
 Also, the backtest is currently technical-only. The live scan includes the fundamental layer, but the historical backtest does not yet use point-in-time fundamental data.
+
+## Portfolio Growth Plan
+
+`portfolio_growth_plan.py` is a planning calculator for turning a portfolio goal into a return hurdle and sleeve-level strategy map.
+
+It helps answer questions such as:
+
+- what annualized return is required to move from current NAV to target NAV by a fixed date
+- how much of the portfolio is assigned to each strategy sleeve
+- how much gross exposure a leveraged sleeve creates
+- whether a proposed mix of core growth, income, and tactical sleeves is enough to close the gap
+- how much gross buying-power headroom remains if you include margin availability
+- what the remaining headroom would need to earn to close any gap that is left
+
+Example:
+
+```powershell
+python.exe .\portfolio_growth_plan.py --current-nav 20000000 --target-nav 25000000 --start-date 2026-07-08 --end-date 2026-12-31 --sleeve "core_growth,12000000,1.0,0.18" --sleeve "income,5000000,1.0,0.10" --sleeve "tactical_margin,3000000,2.0,0.22"
+```
+
+Each sleeve is:
+
+```text
+name,net_capital,gross_multiple,annual_return
+```
+
+This lets you model margin-enhanced sleeves separately from the net capital assigned to them.
+
+You can also use built-in presets such as:
+
+- `balanced_boost`
+- `barbell_boost`
+- `aggressive_margin`
+- `income_plus_tactical`
+- `semi_offense`
+- `goal_seek_25m`
+
+Example with a preset and margin headroom:
+
+```powershell
+python.exe .\portfolio_growth_plan.py --current-nav 20000000 --target-nav 25000000 --start-date 2026-07-08 --end-date 2026-12-31 --margin-available 27000000 --preset aggressive_margin
+```
+
+Compare all built-in presets side by side:
+
+```powershell
+python.exe .\portfolio_growth_plan.py --current-nav 20000000 --target-nav 25000000 --start-date 2026-07-08 --end-date 2026-12-31 --margin-available 27000000 --compare-presets
+```
+
+Stress a preset under different tactical-return and monthly-flow assumptions:
+
+```powershell
+python.exe .\portfolio_growth_plan.py --current-nav 20000000 --target-nav 25000000 --start-date 2026-07-08 --end-date 2026-12-31 --margin-available 27000000 --preset goal_seek_25m --scenario-grid
+```
+
+Build a live blueprint that maps a preset to current quant-ranked candidates and your existing holdings:
+
+```powershell
+python.exe .\portfolio_growth_plan.py --current-nav 20000000 --target-nav 25000000 --start-date 2026-07-08 --end-date 2026-12-31 --margin-available 27000000 --preset goal_seek_25m --csv .\my_holdings.csv --live-blueprint
+```
+
+The newer presets are meant to reflect more strategy-specific sleeve types:
+
+- `covered_income_etf`
+- `cash_secured_put_income`
+- `bull_call_spread_tactical`
+- `high_conviction_growth`
+- `semi_momentum_tactical`
+
+This makes the planner more useful for comparing realistic boost mixes instead of only generic core/income/tactical buckets.
+
+You can also stress tactical sleeves directly:
+
+- `--tactical-return-shift -0.08`
+- `--tactical-return-shift 0.05`
+
+And you can stress cash-flow assumptions in the scenario grid with:
+
+- `--flow-grid "0,50000,100000,200000"`
+- `--tactical-shift-grid "-0.10,-0.05,0.00,0.05"`
+
+The live blueprint mode currently maps sleeves to candidate groups such as:
+
+- high-conviction growth names from the Nasdaq-100 model
+- semi momentum tactical names
+- cash-secured-put income candidates
+- covered-income ETF sleeves already present in holdings
+
+Tickers already present in the holdings CSV are marked with `*` in the blueprint output.
 
 ## Methodology
 

@@ -36,6 +36,7 @@ from portfolio_core import default_csv_path, load_schwab_holdings
 NASDAQ100_COMPANIES_URL = "https://www.nasdaq.com/solutions/global-indexes/nasdaq-100/companies"
 USER_AGENT = "Mozilla/5.0"
 LOOKBACK_BUFFER_DAYS = 260
+COINBASE_PRODUCTS_URL = "https://api.coinbase.com/api/v3/brokerage/market/products"
 
 
 @dataclass
@@ -98,6 +99,116 @@ def fetch_price_history(tickers: list[str], years: int) -> pd.DataFrame:
     if data.empty:
         raise RuntimeError("No price history returned from yfinance.")
     return data
+
+
+def fetch_live_quote_snapshot(ticker: str) -> dict[str, float | str | None]:
+    if yf is None:
+        raise RuntimeError("yfinance not installed. Run: pip install yfinance")
+
+    tk = yf.Ticker(ticker)
+    info = {}
+    fast = {}
+    try:
+        info = tk.info or {}
+    except Exception:
+        info = {}
+    try:
+        fast = dict(tk.fast_info)
+    except Exception:
+        fast = {}
+
+    regular = info.get("regularMarketPrice")
+    if regular is None or pd.isna(regular):
+        regular = fast.get("lastPrice")
+
+    previous_close = info.get("regularMarketPreviousClose")
+    if previous_close is None or pd.isna(previous_close):
+        previous_close = fast.get("regularMarketPreviousClose")
+
+    post = info.get("postMarketPrice")
+    post_source = "yahoo_post"
+    if post is None or pd.isna(post):
+        post = fast.get("postMarketPrice")
+        post_source = "yahoo_post"
+    if post is None or pd.isna(post):
+        post = info.get("preMarketPrice")
+        post_source = "yahoo_pre"
+    if post is None or pd.isna(post):
+        post = fast.get("preMarketPrice")
+        post_source = "yahoo_pre"
+    if post is None or pd.isna(post):
+        post_source = None
+
+    return {
+        "regular": safe_float(regular),
+        "previous_close": safe_float(previous_close),
+        "post": safe_float(post),
+        "post_source": post_source,
+    }
+
+
+def fetch_coinbase_equity_perp_snapshots() -> dict[str, dict[str, float | str | None]]:
+    if requests is None:
+        return {}
+
+    params = {
+        "product_type": "FUTURE",
+        "contract_expiry_type": "PERPETUAL",
+        "futures_underlying_type": "FUTURES_UNDERLYING_TYPE_EQUITY",
+        "limit": 500,
+    }
+    try:
+        response = requests.get(COINBASE_PRODUCTS_URL, params=params, timeout=20)
+        response.raise_for_status()
+        products = response.json().get("products", [])
+    except Exception:
+        return {}
+
+    out: dict[str, dict[str, float | str | None]] = {}
+    for product in products:
+        details = product.get("future_product_details") or {}
+        ticker = (details.get("contract_code") or "").strip().upper()
+        if not ticker:
+            continue
+
+        index_price = pd.to_numeric(details.get("index_price"), errors="coerce")
+        last_price = pd.to_numeric(product.get("price"), errors="coerce")
+        mid_price = pd.to_numeric(product.get("mid_market_price"), errors="coerce")
+
+        synthetic_price = index_price
+        price_source = "coinbase_perp_index"
+        if pd.isna(synthetic_price):
+            synthetic_price = last_price
+            price_source = "coinbase_perp_last"
+        if pd.isna(synthetic_price):
+            synthetic_price = mid_price
+            price_source = "coinbase_perp_mid"
+
+        out[ticker] = {
+            "ticker": ticker,
+            "synthetic_price": float(synthetic_price) if not pd.isna(synthetic_price) else None,
+            "price_source": price_source if not pd.isna(synthetic_price) else None,
+        }
+    return out
+
+
+def choose_extended_hours_price(
+    ticker: str,
+    quote: dict[str, float | str | None],
+    perp_quote: dict[str, float | str | None],
+    *,
+    prefer_perp: bool = False,
+) -> tuple[float | None, str | None]:
+    perp_price = perp_quote.get("synthetic_price")
+    perp_source = perp_quote.get("price_source")
+    if prefer_perp and perp_price is not None:
+        return perp_price, perp_source
+
+    post_price = quote.get("post")
+    post_source = quote.get("post_source")
+    if post_price is None and perp_price is not None:
+        return perp_price, perp_source
+    return post_price, post_source
 
 
 def safe_float(value) -> float:
@@ -387,6 +498,83 @@ def attach_fundamental_scores(df: pd.DataFrame, fundamentals: pd.DataFrame) -> p
     return out.sort_values(["final_score", "technical_score"], ascending=[False, False]).reset_index(drop=True)
 
 
+def attach_overnight_overlay(
+    df: pd.DataFrame,
+    tickers: list[str],
+    *,
+    prefer_perp: bool = False,
+) -> pd.DataFrame:
+    out = df.copy()
+    quotes: dict[str, dict[str, float | str | None]] = {}
+    perps = fetch_coinbase_equity_perp_snapshots() if prefer_perp else {}
+
+    tracked = sorted(set(tickers + ["QQQ"]))
+    for ticker in tracked:
+        try:
+            quotes[ticker] = fetch_live_quote_snapshot(ticker)
+        except Exception:
+            quotes[ticker] = {"regular": float("nan"), "previous_close": float("nan"), "post": float("nan"), "post_source": None}
+
+    qqq_quote = quotes.get("QQQ", {})
+    qqq_ext_price, qqq_ext_source = choose_extended_hours_price("QQQ", qqq_quote, perps.get("QQQ", {}), prefer_perp=prefer_perp)
+    qqq_regular = qqq_quote.get("regular")
+    qqq_overnight_return = float("nan")
+    if qqq_ext_price is not None and qqq_regular is not None and not pd.isna(qqq_regular) and qqq_regular != 0:
+        qqq_overnight_return = float(qqq_ext_price / qqq_regular - 1.0)
+
+    overnight_rows: list[dict[str, object]] = []
+    for ticker in tickers:
+        quote = quotes.get(ticker, {})
+        ext_price, ext_source = choose_extended_hours_price(ticker, quote, perps.get(ticker, {}), prefer_perp=prefer_perp)
+        regular = quote.get("regular")
+        overnight_return = float("nan")
+        overnight_alpha = float("nan")
+        overnight_score = 50.0
+
+        if ext_price is not None and regular is not None and not pd.isna(regular) and regular != 0:
+            overnight_return = float(ext_price / regular - 1.0)
+            if not pd.isna(qqq_overnight_return):
+                overnight_alpha = overnight_return - qqq_overnight_return
+
+            overnight_score = 50.0
+            overnight_score += max(min(overnight_return * 4000.0, 25.0), -25.0)
+            if not pd.isna(overnight_alpha):
+                overnight_score += max(min(overnight_alpha * 5000.0, 20.0), -20.0)
+
+            row = out.loc[out["ticker"] == ticker].iloc[0]
+            if ext_price > row["ema21"]:
+                overnight_score += 10.0
+            elif ext_price < row["ema21"]:
+                overnight_score -= 10.0
+
+            if not pd.isna(row["atr14"]) and row["atr14"] > 0:
+                atr_stretch = abs(ext_price - regular) / row["atr14"]
+                if atr_stretch > 1.5:
+                    overnight_score -= min((atr_stretch - 1.5) * 10.0, 15.0)
+
+            overnight_score = max(0.0, min(100.0, overnight_score))
+
+        overnight_rows.append(
+            {
+                "ticker": ticker,
+                "overnight_price": ext_price,
+                "overnight_source": ext_source,
+                "overnight_return": overnight_return,
+                "overnight_alpha": overnight_alpha,
+                "overnight_score": overnight_score,
+                "qqq_overnight_return": qqq_overnight_return,
+                "qqq_overnight_source": qqq_ext_source,
+            }
+        )
+
+    overnight_df = pd.DataFrame(overnight_rows)
+    out = out.merge(overnight_df, on="ticker", how="left")
+    out["base_final_score"] = out["final_score"]
+    out["final_score"] = 0.85 * out["base_final_score"] + 0.15 * out["overnight_score"].fillna(50.0)
+    out["rank"] = out["final_score"].rank(ascending=False, method="first")
+    return out.sort_values(["final_score", "base_final_score"], ascending=[False, False]).reset_index(drop=True)
+
+
 def classify_actions(df: pd.DataFrame, config: ModelConfig, held_tickers: set[str], risk_on: bool) -> pd.DataFrame:
     out = df.copy()
     out["held"] = out["ticker"].isin(held_tickers)
@@ -421,7 +609,7 @@ def load_held_tickers(csv_path: str | None, script_file: str) -> set[str]:
     return tickers
 
 
-def print_scan_report(scored: pd.DataFrame, regime: dict[str, object], top_n: int) -> None:
+def print_scan_report(scored: pd.DataFrame, regime: dict[str, object], top_n: int, *, use_overnight: bool = False) -> None:
     print("Nasdaq-100 Quant Model")
     print("=" * 100)
     print(
@@ -429,6 +617,14 @@ def print_scan_report(scored: pd.DataFrame, regime: dict[str, object], top_n: in
         f"21EMA={regime['qqq_ema21']:.2f} | 50MA={regime['qqq_sma50']:.2f} | "
         f"200MA={regime['qqq_sma200']:.2f} | Regime={'RISK-ON' if regime['risk_on'] else 'RISK-OFF'}"
     )
+    if use_overnight and "qqq_overnight_return" in scored.columns:
+        first_row = scored.iloc[0]
+        qqq_ov = first_row.get("qqq_overnight_return")
+        qqq_src = first_row.get("qqq_overnight_source")
+        if qqq_ov is not None and not pd.isna(qqq_ov):
+            print(f"Overnight overlay active | QQQ overnight return={qqq_ov * 100.0:.2f}% | source={qqq_src}")
+        else:
+            print("Overnight overlay active | no current extended-hours QQQ quote was available")
 
     display_cols = [
         "ticker",
@@ -439,6 +635,10 @@ def print_scan_report(scored: pd.DataFrame, regime: dict[str, object], top_n: in
         "technical_score",
         "fundamental_score",
         "risk_quality_score",
+        "overnight_score",
+        "overnight_return",
+        "overnight_alpha",
+        "overnight_source",
         "rsi14",
         "forward_pe",
         "price_to_sales_ttm",
@@ -480,7 +680,15 @@ def build_indicators_for_universe(history: pd.DataFrame, tickers: list[str]) -> 
     return indicators
 
 
-def scan_model(years: int, top_n: int, csv_path: str | None, output: str | None) -> int:
+def scan_model(
+    years: int,
+    top_n: int,
+    csv_path: str | None,
+    output: str | None,
+    *,
+    use_overnight: bool = False,
+    prefer_perp: bool = False,
+) -> int:
     tickers = fetch_nasdaq100_constituents()
     history = fetch_price_history(sorted(set(tickers + ["QQQ"])), years)
     indicators = build_indicators_for_universe(history, tickers)
@@ -494,9 +702,11 @@ def scan_model(years: int, top_n: int, csv_path: str | None, output: str | None)
     candidate_tickers.update(ticker for ticker in held_tickers if ticker in indicators)
     fundamentals = fetch_fundamental_snapshots(sorted(candidate_tickers))
     scored = attach_fundamental_scores(scored, fundamentals)
+    if use_overnight:
+        scored = attach_overnight_overlay(scored, sorted(candidate_tickers), prefer_perp=prefer_perp)
     scored = classify_actions(scored, ModelConfig(top_n=top_n), held_tickers, bool(regime["risk_on"]))
     print(f"Fundamental candidate set size: {len(candidate_tickers)}")
-    print_scan_report(scored, regime, top_n)
+    print_scan_report(scored, regime, top_n, use_overnight=use_overnight)
 
     if output:
         output_path = Path(output)
@@ -645,6 +855,8 @@ def main() -> int:
     scan_parser.add_argument("--years", type=int, default=2, help="Years of price history to download for the scan (default: 2).")
     scan_parser.add_argument("--csv", default=None, help="Optional Schwab holdings CSV to tag currently held tickers.")
     scan_parser.add_argument("--output", default=None, help="Optional CSV path for the scan results.")
+    scan_parser.add_argument("--use-overnight", action="store_true", help="Blend extended-hours price action into the live scan.")
+    scan_parser.add_argument("--prefer-perp", action="store_true", help="Prefer Coinbase equity perpetual prices over Yahoo post/pre-market when available.")
 
     bt_parser = subparsers.add_parser("backtest", help="Run a simple weekly-rebalance backtest.")
     bt_parser.add_argument("--top", type=int, default=12, help="Number of top-ranked names to hold (default: 12).")
@@ -656,7 +868,14 @@ def main() -> int:
     args = parser.parse_args()
     try:
         if args.command == "scan":
-            return scan_model(args.years, args.top, args.csv, args.output)
+            return scan_model(
+                args.years,
+                args.top,
+                args.csv,
+                args.output,
+                use_overnight=args.use_overnight,
+                prefer_perp=args.prefer_perp,
+            )
         if args.command == "backtest":
             return backtest_model(args.years, args.top, args.output)
         if args.command == "universe":

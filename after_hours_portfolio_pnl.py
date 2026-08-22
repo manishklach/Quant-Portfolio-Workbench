@@ -579,16 +579,32 @@ def choose_after_hours_price(
 
     if overnight:
         active_session = current_extended_session_bucket()
+        overnight_price = quote.get("overnight")
+        overnight_source = quote.get("overnight_source")
+        premarket_price = quote.get("premarket")
+        premarket_source = quote.get("premarket_source")
+        post_price = quote.get("post")
+        post_source = quote.get("post_source")
+
         if active_session == "pre_market":
-            premarket_price = quote.get("premarket")
-            premarket_source = quote.get("premarket_source")
             if premarket_price is not None:
                 return premarket_price, premarket_source
-        elif active_session == "overnight":
-            overnight_price = quote.get("overnight")
-            overnight_source = quote.get("overnight_source")
             if overnight_price is not None:
                 return overnight_price, overnight_source
+        elif active_session == "overnight":
+            if overnight_price is not None:
+                return overnight_price, overnight_source
+            if premarket_price is not None:
+                return premarket_price, premarket_source
+
+        # Fallback order for weekend gaps / unavailable session-specific prints:
+        # prefer any other non-regular quote before giving up.
+        if premarket_price is not None:
+            return premarket_price, premarket_source
+        if overnight_price is not None:
+            return overnight_price, overnight_source
+        if post_price is not None:
+            return post_price, post_source
         if not prefer_perp:
             return None, None
 
@@ -1077,6 +1093,56 @@ def build_after_hours_report(
     return positions, by_ticker
 
 
+def fetch_index_futures_snapshot() -> pd.DataFrame:
+    if yf is None:
+        return pd.DataFrame(columns=["label", "symbol", "last", "source"])
+
+    contracts = [
+        {"label": "NAS FUTS", "symbol": "NQ=F"},
+        {"label": "SPX FUTS", "symbol": "ES=F"},
+    ]
+    rows: list[dict[str, object]] = []
+
+    for contract in contracts:
+        symbol = str(contract["symbol"])
+        last = None
+        source = None
+        try:
+            tk = yf.Ticker(symbol)
+            fast = {}
+            try:
+                fast = dict(tk.fast_info)
+            except Exception:
+                fast = {}
+
+            last = fast.get("lastPrice")
+            if last is None or pd.isna(last):
+                last = fast.get("last_price")
+            if last is not None and not pd.isna(last):
+                source = "yahoo_fast_info"
+
+            if last is None or pd.isna(last):
+                hist = tk.history(period="2d", interval="5m", prepost=True, auto_adjust=False)
+                closes = hist["Close"].dropna() if "Close" in hist else pd.Series(dtype=float)
+                if not closes.empty:
+                    last = float(closes.iloc[-1])
+                    source = "yahoo_5m_close"
+        except Exception:
+            last = None
+            source = None
+
+        rows.append(
+            {
+                "label": contract["label"],
+                "symbol": symbol,
+                "last": float(last) if last is not None and not pd.isna(last) else None,
+                "source": source,
+            }
+        )
+
+    return pd.DataFrame(rows)
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Estimate after-hours / overnight portfolio P/L from my_holdings.csv")
     parser.add_argument("csv", nargs="?", help="Optional positional path to holdings CSV")
@@ -1244,6 +1310,14 @@ def main() -> int:
     print(f"Estimated After-Hours P/L: ${total_ah_pl:,.2f}")
     if total_market_value:
         print(f"Estimated After-Hours Return: {100.0 * total_ah_pl / total_market_value:.4f}%")
+
+    futures = fetch_index_futures_snapshot()
+    if not futures.empty:
+        print("\nIndex Futures")
+        display = futures.copy()
+        for col in ["last"]:
+            display[col] = pd.to_numeric(display[col], errors="coerce")
+        print(display.to_string(index=False))
 
     if args.output:
         output_path = Path(args.output)
