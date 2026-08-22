@@ -221,6 +221,62 @@ def format_spread_display_table(df_out):
     return display_df.to_string(index=False)
 
 
+def print_bullish_max_profit(df_cash_secured_puts, df_put_spreads, ticker_filter=None):
+    """Print maximum expiry profit for uncovered short puts and put credit spreads."""
+    label = f" for {ticker_filter}" if ticker_filter else ""
+    csp_max_profit = df_cash_secured_puts['Premium Collected ($)'].sum()
+    pcs_max_profit = df_put_spreads['Premium Collected ($)'].sum()
+
+    print('Bullish Max Profit: Cash-Secured Puts and Put Credit Spreads')
+    print('Assumes each underlying is at or above its short-put strike at expiration, so all short puts expire worthless.')
+
+    print('\n--- CASH-SECURED / UNCOVERED SHORT PUTS ---')
+    if df_cash_secured_puts.empty:
+        print('No cash-secured or uncovered short puts identified.')
+    else:
+        csp_display = df_cash_secured_puts[
+            ['Ticker', 'Expiration', 'Strike Price', 'Contracts Sold', 'Premium Collected ($)']
+        ].rename(
+            columns={
+                'Strike Price': 'Strike',
+                'Contracts Sold': 'Ctr',
+                'Premium Collected ($)': 'Max Profit',
+            }
+        )
+        print(csp_display.to_string(index=False, formatters={'Max Profit': lambda value: f'${value:,.2f}'}))
+    print(f'Cash-secured put max profit{label}: ${csp_max_profit:,.2f}')
+
+    print('\n--- PUT CREDIT SPREADS ---')
+    if df_put_spreads.empty:
+        print('No put credit spreads identified.')
+    else:
+        pcs_display = df_put_spreads.copy()
+        pcs_display['Spread'] = pcs_display.apply(
+            lambda row: f"{row['Strike Price']:.0f}/{row['Long Strike Price']:.0f}", axis=1
+        )
+        pcs_display = pcs_display[
+            ['Ticker', 'Expiration', 'Spread', 'Contracts Sold', 'Premium Collected ($)', 'Max Spread Loss ($)']
+        ].rename(
+            columns={
+                'Contracts Sold': 'Ctr',
+                'Premium Collected ($)': 'Max Profit',
+                'Max Spread Loss ($)': 'Gross Width Risk',
+            }
+        )
+        print(
+            pcs_display.to_string(
+                index=False,
+                formatters={
+                    'Max Profit': lambda value: f'${value:,.2f}',
+                    'Gross Width Risk': lambda value: f'${value:,.2f}',
+                },
+            )
+        )
+    print(f'Put credit spread max profit{label}: ${pcs_max_profit:,.2f}')
+
+    print(f'\nCombined Bullish Max Profit{label}: ${csp_max_profit + pcs_max_profit:,.2f}')
+
+
 def find_uncovered_short_puts(df_puts, stock_prices, stock_day_changes):
     uncovered_rows = []
     delta_cache = {}
@@ -289,6 +345,10 @@ def find_uncovered_short_puts(df_puts, stock_prices, stock_day_changes):
                     uncovered['Moneyness Status'] = 'In the Money'
                 uncovered['Current Mkt Value'] = clean_numeric(short_row['Mkt Val (Market Value)']) * ratio
                 uncovered['Cash Secured ($)'] = remaining_short * 100 * short_strike
+                uncovered['Premium Collected ($)'] = max(
+                    -clean_numeric(short_row.get('Cost Basis', 0.0)) * ratio,
+                    0.0,
+                )
                 uncovered_rows.append(uncovered)
 
     if not uncovered_rows:
@@ -301,6 +361,7 @@ def find_uncovered_short_puts(df_puts, stock_prices, stock_day_changes):
             'Moneyness Status',
             'Current Mkt Value',
             'Cash Secured ($)',
+            'Premium Collected ($)',
         ]
         return pd.DataFrame(columns=columns)
 
@@ -503,6 +564,11 @@ def main():
         help='Output Excel path (default: naked_short_puts.xlsx next to script)',
     )
     parser.add_argument('--ticker', default=None, help='Filter to a specific ticker (e.g. MU)')
+    parser.add_argument(
+        '--max',
+        action='store_true',
+        help='Show bullish maximum profit for cash-secured puts and put credit spreads, optionally filtered by --ticker.',
+    )
     args = parser.parse_args()
 
     csv_path = default_csv_path(args.file, __file__)
@@ -512,15 +578,23 @@ def main():
         else default_csv_path(args.output, __file__)
     )
 
-    print('\nReviewing short put exposure from holdings...\n')
-
     df = load_schwab_holdings(csv_path)
     df_options = active_option_positions(df)
     df_options['Ticker'] = df_options['Underlying']
     df_puts = df_options[df_options['Opt Type'] == 'P'].copy()
+    ticker_filter = None
     if args.ticker:
         ticker_filter = args.ticker.strip().upper()
         df_puts = df_puts[df_puts['Ticker'].astype(str).str.upper() == ticker_filter].copy()
+
+    if args.max:
+        # This view is based on the position's original net credit, not a live quote.
+        df_cash_secured_puts = find_uncovered_short_puts(df_puts, {}, {})
+        df_put_spreads = find_put_spread_short_legs(df_puts, {}, {})
+        print_bullish_max_profit(df_cash_secured_puts, df_put_spreads, ticker_filter)
+        return
+
+    print('\nReviewing short put exposure from holdings...\n')
     if 'Delta' in df_puts.columns:
         df_puts['Delta Numeric'] = df_puts['Delta'].apply(clean_numeric)
     else:
