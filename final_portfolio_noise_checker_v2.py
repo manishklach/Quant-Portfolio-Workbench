@@ -15,8 +15,9 @@ CALL SPREADS:
     - long lower-strike call + short higher-strike call
     - same ticker + same expiration
     - stock price > short call strike
-    - stock day change > 0
+    - stock day change > 0 OR previous close > short call strike
     - net spread day P/L < 0
+  Addback is an intrinsic-based scenario adjustment, not verified pricing error.
 
 PUTS:
   NAKED short puts:
@@ -272,7 +273,7 @@ def find_bad_itm_upday_call_spreads(options, quotes):
         if not q:
             continue
         last, prev, stock_chg = q.get("last"), q.get("prev_close"), q.get("stock_change")
-        if pd.isna(last) or pd.isna(prev) or pd.isna(stock_chg) or stock_chg <= 0:
+        if pd.isna(last) or pd.isna(prev) or pd.isna(stock_chg):
             continue
 
         longs = [
@@ -307,7 +308,7 @@ def find_bad_itm_upday_call_spreads(options, quotes):
                     break
 
                 contracts = min(long_leg["remaining_qty"], remaining_short)
-                if contracts <= 0 or last <= upper:
+                if contracts <= 0:
                     continue
 
                 lower = long_leg["strike"]
@@ -315,7 +316,9 @@ def find_bad_itm_upday_call_spreads(options, quotes):
                 short_day_pl = short_leg["day_pl"] * contracts / short_leg["original_qty"]
                 actual = long_day_pl + short_day_pl
 
-                if actual < 0:
+                # Consume every matched pair, including those excluded from the report.
+                eligible = last > upper and (stock_chg > 0 or prev > upper)
+                if eligible and actual < 0:
                     expected = call_spread_intrinsic(last, lower, upper, contracts) - call_spread_intrinsic(prev, lower, upper, contracts)
                     diff = expected - actual
 
@@ -330,6 +333,7 @@ def find_bad_itm_upday_call_spreads(options, quotes):
                         "schwab_net_day_pl": actual,
                         "intrinsic_expected_day_pl": expected,
                         "diff_to_add_back": diff,
+                        "adjustment_basis": "intrinsic_scenario_not_verified_pricing_error",
                     })
 
                 long_leg["remaining_qty"] -= contracts
@@ -757,7 +761,7 @@ def main():
 
     total = call_addback + put_addback + put_spread_addback
     summary = pd.DataFrame([
-        {"bucket": "Bad ITM up-day call spreads", "count": len(bad_calls), "addback": call_addback},
+        {"bucket": "ITM call spreads intrinsic adjustment", "count": len(bad_calls), "addback": call_addback},
         {"bucket": "OTM naked short puts delta check", "count": len(puts), "addback": put_addback},
         {"bucket": "OTM up-day put spreads", "count": len(put_spreads), "addback": put_spread_addback},
         {"bucket": "TOTAL", "count": len(bad_calls) + len(puts) + len(put_spreads), "addback": total},
@@ -776,7 +780,7 @@ def main():
 
     with pd.ExcelWriter(xlsx_path, engine="openpyxl") as w:
         summary.to_excel(w, index=False, sheet_name="Summary")
-        bad_calls.to_excel(w, index=False, sheet_name="Bad ITM Up-Day Calls")
+        bad_calls.to_excel(w, index=False, sheet_name="ITM Call Adjustments")
         puts.to_excel(w, index=False, sheet_name="OTM Naked Short Puts")
         put_spreads.to_excel(w, index=False, sheet_name="OTM Up-Day Put Spreads")
         quotes.to_excel(w, index=False, sheet_name="Quotes")
@@ -786,9 +790,10 @@ def main():
     print("=" * 72)
 
     print("\nCALL SPREAD RULE:")
-    print("  ITM call spreads only, stock up, but spread net day P/L is negative.")
+    print("  Negative day P/L with stock above the short strike; stock up OR both closes above the short strike.")
+    print("  Intrinsic-based scenario adjustment; does not establish that broker marks are wrong.")
     if bad_calls.empty:
-        print("  No bad ITM up-day call spreads found.")
+        print("  No qualifying ITM call-spread losses found.")
     else:
         cols = ["ticker", "expiration", "spread", "contracts", "stock_change", "schwab_net_day_pl", "intrinsic_expected_day_pl", "diff_to_add_back"]
         print(bad_calls[cols].to_string(index=False))
@@ -814,7 +819,7 @@ def main():
 
     print("\nSUMMARY")
     print(summary.to_string(index=False))
-    print(f"\nTOTAL CLEAN ADD-BACK: ${total:,.2f}")
+    print(f"\nTOTAL MODEL ADD-BACK: ${total:,.2f}")
 
     print("\nFiles written:")
     print(f"  {bad_calls_path}")
