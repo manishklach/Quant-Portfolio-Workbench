@@ -18,6 +18,12 @@ Run the latest checker against a Schwab holdings CSV:
 python.exe .\final_portfolio_noise_checker_v2.py .\my_holdings.csv
 ```
 
+Show an estimated live portfolio valuation without modifying the holdings CSV. Listed stocks and ETFs refresh from Yahoo, while active options use matching option-chain marks when available:
+
+```powershell
+python.exe .\portfolio_risk_report.py --file .\my_holdings.csv --live
+```
+
 Optional: force yfinance IV plus Black-Scholes delta instead of any CSV delta column:
 
 ```powershell

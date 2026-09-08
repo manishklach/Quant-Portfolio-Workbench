@@ -1,6 +1,7 @@
 """Generate a consolidated portfolio summary with approximate option Greeks and stress scenarios."""
 
 import argparse
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 
 import numpy as np
@@ -13,6 +14,10 @@ from portfolio_core import (
     estimate_equity_equivalent_exposure,
     load_schwab_holdings,
 )
+
+
+LIVE_QUOTE_WORKERS = 8
+LIVE_EQUITY_ASSET_TYPES = {"Equity", "ETFs & Closed End Funds", "Mutual Funds"}
 
 
 def norm_cdf(x):
@@ -62,16 +67,23 @@ def bs_theta_vec(spot, strike, t, r, sigma, opt_type):
     return np.where(np.asarray(opt_type) == "C", call_theta, put_theta)
 
 
-def build_option_risk_frame(df: pd.DataFrame, risk_free_rate: float) -> pd.DataFrame:
+def build_option_risk_frame(
+    df: pd.DataFrame,
+    risk_free_rate: float,
+    underlying_prices: dict[str, float] | None = None,
+) -> pd.DataFrame:
     options = active_option_positions(df)
     if options.empty:
         return options
 
     options = options.copy()
-    options["Spot Proxy"] = np.where(
+    spot_fallback = np.where(
         options["Strike Price"].fillna(0.0) > 0,
         options["Strike Price"].astype(float),
         np.maximum(options["Price Numeric"].astype(float) * 100.0, 1.0),
+    )
+    options["Spot Proxy"] = options["Underlying"].map(underlying_prices or {}).fillna(
+        pd.Series(spot_fallback, index=options.index)
     )
     options["T"] = np.maximum(options["Days To Expiry"].fillna(1).astype(float), 1.0) / 365.0
     price_ratio = options["Price Numeric"].astype(float) / np.maximum(options["Spot Proxy"].astype(float), 1.0)
@@ -96,6 +108,153 @@ def build_option_risk_frame(df: pd.DataFrame, risk_free_rate: float) -> pd.DataF
     options["Vega Dollars 1 Vol"] = options["Qty"] * options["Multiplier"] * options["Vega"] * 0.01
     options["Theta Dollars 1 Day"] = options["Qty"] * options["Multiplier"] * options["Theta"] / 365.0
     return options
+
+
+def fetch_live_equity_quote(ticker: str) -> float | None:
+    """Fetch the latest usable Yahoo quote for a listed equity or ETF."""
+    try:
+        instrument = yf.Ticker(ticker)
+        fast = dict(instrument.fast_info)
+        for key in ("last_price", "lastPrice"):
+            value = fast.get(key)
+            if value is not None and not pd.isna(value) and float(value) > 0:
+                return float(value)
+
+        history = instrument.history(period="1d", interval="1m", auto_adjust=False)
+        if not history.empty and "Close" in history:
+            closes = history["Close"].dropna()
+            if not closes.empty and float(closes.iloc[-1]) > 0:
+                return float(closes.iloc[-1])
+    except Exception:
+        pass
+    return None
+
+
+def fetch_option_chain_marks(
+    underlying: str,
+    expiration: str,
+    option_rows: pd.DataFrame,
+) -> dict[tuple[str, str, str, float], tuple[float, str]]:
+    """Fetch midpoint/last marks for all held strikes in a single option chain."""
+    try:
+        expiry_iso = datetime.strptime(expiration, "%m/%d/%Y").strftime("%Y-%m-%d")
+        instrument = yf.Ticker(underlying)
+        expirations = list(instrument.options or [])
+        if expiry_iso not in expirations:
+            return {}
+
+        chain = instrument.option_chain(expiry_iso)
+    except Exception:
+        return {}
+
+    marks: dict[tuple[str, str, str, float], tuple[float, str]] = {}
+    for option_type, chain_rows in (("C", chain.calls), ("P", chain.puts)):
+        if chain_rows is None or chain_rows.empty:
+            continue
+        held_strikes = option_rows.loc[
+            option_rows["Opt Type"] == option_type, "Strike Price"
+        ].dropna().astype(float).unique()
+        for strike in held_strikes:
+            candidates = chain_rows[np.isclose(chain_rows["strike"].astype(float), strike, atol=0.01)]
+            if candidates.empty:
+                continue
+            quote = candidates.iloc[0]
+            bid = pd.to_numeric(quote.get("bid"), errors="coerce")
+            ask = pd.to_numeric(quote.get("ask"), errors="coerce")
+            last = pd.to_numeric(quote.get("lastPrice"), errors="coerce")
+            if pd.notna(bid) and pd.notna(ask) and bid >= 0 and ask >= bid and ask > 0:
+                marks[(underlying, expiration, option_type, float(strike))] = (
+                    float((bid + ask) / 2.0),
+                    "option_chain_mid",
+                )
+            elif pd.notna(last) and last > 0:
+                marks[(underlying, expiration, option_type, float(strike))] = (
+                    float(last),
+                    "option_chain_last",
+                )
+    return marks
+
+
+def refresh_live_market_values(df: pd.DataFrame) -> tuple[pd.DataFrame, dict[str, object]]:
+    """Return a valuation copy with Yahoo equity and option-chain marks where available."""
+    out = df.copy()
+    out["Live Price"] = out["Price Numeric"]
+    out["Live Price Source"] = "csv_snapshot"
+    out["Live Marked"] = False
+
+    active_options = active_option_positions(out)
+
+    equity_rows = out[
+        (~out["Is Option"])
+        & out["Asset Type Normalized"].isin(LIVE_EQUITY_ASSET_TYPES)
+        & out["Symbol"].astype(str).str.upper().str.match(r"^[A-Z][A-Z0-9.\-]{0,9}$", na=False)
+        & (out["Qty"] != 0)
+    ]
+    equity_tickers = sorted(equity_rows["Symbol"].astype(str).str.upper().unique())
+    quote_tickers = sorted(
+        set(equity_tickers)
+        | set(active_options["Underlying"].astype(str).str.upper().unique())
+    )
+    live_quotes: dict[str, float] = {}
+    with ThreadPoolExecutor(max_workers=LIVE_QUOTE_WORKERS) as executor:
+        pending = {executor.submit(fetch_live_equity_quote, ticker): ticker for ticker in quote_tickers}
+        for future in as_completed(pending):
+            try:
+                price = future.result()
+            except Exception:
+                price = None
+            if price is not None:
+                live_quotes[pending[future]] = price
+
+    for index, row in equity_rows.iterrows():
+        ticker = str(row["Symbol"]).upper()
+        price = live_quotes.get(ticker)
+        if price is None:
+            continue
+        out.at[index, "Live Price"] = price
+        out.at[index, "Price Numeric"] = price
+        out.at[index, "Market Value Numeric"] = float(row["Qty"]) * price
+        out.at[index, "Live Price Source"] = "yahoo_live"
+        out.at[index, "Live Marked"] = True
+
+    option_marks: dict[tuple[str, str, str, float], tuple[float, str]] = {}
+    option_groups = list(active_options.groupby(["Underlying", "Expiration"], sort=False))
+    with ThreadPoolExecutor(max_workers=LIVE_QUOTE_WORKERS) as executor:
+        pending = {
+            executor.submit(fetch_option_chain_marks, str(underlying), str(expiration), group): (underlying, expiration)
+            for (underlying, expiration), group in option_groups
+        }
+        for future in as_completed(pending):
+            try:
+                option_marks.update(future.result())
+            except Exception:
+                continue
+
+    for index, row in active_options.iterrows():
+        key = (
+            str(row["Underlying"]),
+            str(row["Expiration"]),
+            str(row["Opt Type"]),
+            float(row["Strike Price"]),
+        )
+        mark = option_marks.get(key)
+        if mark is None:
+            continue
+        price, source = mark
+        out.at[index, "Live Price"] = price
+        out.at[index, "Price Numeric"] = price
+        out.at[index, "Market Value Numeric"] = float(row["Qty"]) * float(row["Multiplier"]) * price
+        out.at[index, "Live Price Source"] = source
+        out.at[index, "Live Marked"] = True
+
+    metadata = {
+        "equity_quotes": sum(ticker in live_quotes for ticker in equity_tickers),
+        "equity_total": len(equity_tickers),
+        "option_marks": int(out.loc[out["Is Option"], "Live Marked"].sum()),
+        "option_total": len(active_options),
+        "underlying_prices": live_quotes,
+    }
+    return out, metadata
 
 
 def summarize_call_debit_spreads(options: pd.DataFrame) -> pd.DataFrame:
@@ -264,13 +423,26 @@ def main():
     parser.add_argument("--file", default=None, help="Path to holdings CSV (default: my_holdings.csv next to script)")
     parser.add_argument("--as-of", default=None, help="Valuation date YYYY-MM-DD (default: today in local system date)")
     parser.add_argument("--r", type=float, default=0.04, help="Risk-free rate as decimal (default: 0.04)")
+    parser.add_argument(
+        "--live",
+        action="store_true",
+        help="Refresh listed securities and active option marks from Yahoo without modifying the CSV.",
+    )
     args = parser.parse_args()
 
     as_of = datetime.strptime(args.as_of, "%Y-%m-%d").date() if args.as_of else datetime.now().date()
     csv_path = default_csv_path(args.file, __file__)
     df = load_schwab_holdings(csv_path, as_of=as_of)
+    csv_snapshot_nav = df["Market Value Numeric"].sum()
+    live_metadata: dict[str, object] | None = None
+    if args.live:
+        df, live_metadata = refresh_live_market_values(df)
     df["Equity Equivalent Exposure"] = estimate_equity_equivalent_exposure(df)
-    options = build_option_risk_frame(df, args.r)
+    options = build_option_risk_frame(
+        df,
+        args.r,
+        live_metadata["underlying_prices"] if live_metadata else None,
+    )
     call_spreads = summarize_call_debit_spreads(options) if not options.empty else pd.DataFrame()
     uncovered_puts = summarize_uncovered_short_puts(options) if not options.empty else pd.DataFrame()
     vix_context = load_vix_context(as_of)
@@ -285,9 +457,18 @@ def main():
     print("Portfolio Risk Report")
     print(f"File: {csv_path}")
     print(f"As-Of Date: {as_of}")
+    if live_metadata:
+        print("Valuation: estimated live Yahoo marks; the holdings CSV is unchanged")
 
     print_section("Topline")
     print(f"NAV / Market Value: ${nav:,.2f}")
+    if live_metadata:
+        print(f"Estimated Change Since CSV Mark: ${nav - csv_snapshot_nav:+,.2f}")
+        print(
+            "Live Quote Coverage: "
+            f"{live_metadata['equity_quotes']}/{live_metadata['equity_total']} listed securities | "
+            f"{live_metadata['option_marks']}/{live_metadata['option_total']} active option legs"
+        )
     print(f"Gross Long Market Value: ${long_mv:,.2f}")
     print(f"Gross Short Market Value: ${abs(short_mv):,.2f}")
     print(f"Net Day Change: ${day_change:,.2f}")

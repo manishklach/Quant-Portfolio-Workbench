@@ -651,6 +651,8 @@ def print_scan_report(scored: pd.DataFrame, regime: dict[str, object], top_n: in
         "sma50",
         "sma200",
     ]
+    # Overnight columns exist only when that optional data overlay is enabled.
+    display_cols = [column for column in display_cols if column in scored.columns]
 
     print("\nTop Ranked")
     print(scored.head(top_n)[display_cols].to_string(index=False, justify="right", float_format=lambda x: f"{x:0.2f}"))
