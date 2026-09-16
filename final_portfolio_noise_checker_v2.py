@@ -14,6 +14,7 @@ CALL SPREADS:
   Flag only:
     - long lower-strike call + short higher-strike call
     - same ticker + same expiration
+    - spread width (short - long) <= $10
     - stock price > short call strike
     - stock day change > 0 OR previous close > short call strike
     - net spread day P/L < 0
@@ -33,6 +34,12 @@ PUT SPREADS:
     - stock day change > 0
     - net spread day P/L < net-delta expectation
 
+CALL QUOTE-BASELINE AUDIT:
+  - checks every call, including standalone and wide-spread legs
+  - compares Schwab day P/L with Cboe midpoint-vs-prior-close P/L
+  - corroborates the discrepancy with aggregate Cboe delta exposure
+  - flags a ticker only when Schwab is materially more negative than both checks
+
 Delta:
   - uses CSV/broker Delta column if present
   - otherwise falls back to yfinance option-chain IV + Black-Scholes put delta
@@ -43,8 +50,11 @@ Run:
 """
 
 import argparse
+import json
 import math
 import re
+import urllib.request
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -263,7 +273,130 @@ def long_put_spread_intrinsic(S, lower, upper, contracts):
     return v * contracts * 100
 
 
-def find_bad_itm_upday_call_spreads(options, quotes):
+def cboe_occ_symbol(ticker, expiration, strike, option_type):
+    try:
+        exp = pd.Timestamp(expiration)
+        cp = "C" if str(option_type).upper() == "CALL" else "P"
+        strike_code = int(round(float(strike) * 1000))
+        return f"{ticker}{exp:%y%m%d}{cp}{strike_code:08d}"
+    except Exception:
+        return None
+
+
+def fetch_cboe_chain(ticker, timeout=15.0):
+    url = f"https://cdn.cboe.com/api/global/delayed_quotes/options/{ticker}.json"
+    request = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+    with urllib.request.urlopen(request, timeout=timeout) as response:
+        payload = json.load(response)
+    return payload.get("data", {})
+
+
+def audit_call_day_pl_baselines(options, min_excess=10000.0, timeout=15.0):
+    """Find call books whose reported loss is unsupported by both Cboe marks and delta."""
+    calls = options[options["option_type"] == "CALL"].copy()
+    detail_rows = []
+    errors = []
+
+    groups = {
+        ticker: group
+        for ticker, group in calls.groupby("ticker")
+        if float(group["day_pl"].sum()) < 0
+    }
+    chains = {}
+    with ThreadPoolExecutor(max_workers=min(8, max(len(groups), 1))) as pool:
+        futures = {pool.submit(fetch_cboe_chain, ticker, timeout): ticker for ticker in groups}
+        for future in as_completed(futures):
+            ticker = futures[future]
+            try:
+                chains[ticker] = future.result()
+            except Exception as exc:
+                errors.append({"ticker": ticker, "cboe_error": str(exc)})
+
+    for ticker, group in groups.items():
+        if ticker not in chains:
+            continue
+        try:
+            chain = chains[ticker]
+            option_map = {row.get("option"): row for row in chain.get("options", [])}
+            stock_change = num(chain.get("price_change"))
+        except Exception as exc:
+            errors.append({"ticker": ticker, "cboe_error": str(exc)})
+            continue
+
+        for _, row in group.iterrows():
+            occ = cboe_occ_symbol(ticker, row["expiration"], row["strike"], row["option_type"])
+            quote = option_map.get(occ)
+            if not quote:
+                continue
+
+            bid = num(quote.get("bid"))
+            ask = num(quote.get("ask"))
+            prior = num(quote.get("prev_day_close"))
+            delta = num(quote.get("delta"))
+            if any(pd.isna(value) for value in [bid, ask, prior, delta, stock_change]):
+                continue
+
+            quantity = float(row["quantity"])
+            multiplier = quantity * 100.0
+            midpoint = (bid + ask) / 2.0
+            actual = float(row["day_pl"])
+            cboe_day_pl = (midpoint - prior) * multiplier
+            delta_day_pl = delta * stock_change * multiplier
+            broker_mark = num(row.get("price"))
+            implied_broker_prior = (
+                broker_mark - actual / multiplier
+                if not pd.isna(broker_mark) and multiplier != 0
+                else np.nan
+            )
+            detail_rows.append({
+                "ticker": ticker,
+                "expiration": row["expiration"],
+                "call": f"{float(row['strike']):g} C",
+                "quantity": quantity,
+                "schwab_mark": broker_mark,
+                "cboe_bid": bid,
+                "cboe_ask": ask,
+                "cboe_mid": midpoint,
+                "cboe_prev_close": prior,
+                "implied_schwab_prev": implied_broker_prior,
+                "cboe_delta": delta,
+                "schwab_day_pl": actual,
+                "cboe_mid_day_pl": cboe_day_pl,
+                "delta_expected_day_pl": delta_day_pl,
+                "midpoint_gap": cboe_day_pl - actual,
+                "delta_gap": delta_day_pl - actual,
+                "volume": num(quote.get("volume")),
+                "last_trade_time": quote.get("last_trade_time"),
+            })
+
+    details = pd.DataFrame(detail_rows)
+    if details.empty:
+        return details, pd.DataFrame(), pd.DataFrame(errors)
+
+    ticker_summary = details.groupby("ticker", as_index=False).agg(
+        positions=("call", "count"),
+        schwab_call_day_pl=("schwab_day_pl", "sum"),
+        cboe_mid_call_day_pl=("cboe_mid_day_pl", "sum"),
+        delta_expected_call_day_pl=("delta_expected_day_pl", "sum"),
+        midpoint_gap=("midpoint_gap", "sum"),
+        delta_gap=("delta_gap", "sum"),
+    )
+    ticker_summary["candidate_addback"] = ticker_summary[["midpoint_gap", "delta_gap"]].min(axis=1).clip(lower=0)
+    ticker_summary["flagged"] = (
+        (ticker_summary["schwab_call_day_pl"] < 0)
+        & (ticker_summary["midpoint_gap"] >= min_excess)
+        & (ticker_summary["delta_gap"] >= min_excess)
+    )
+    ticker_summary.loc[~ticker_summary["flagged"], "candidate_addback"] = 0.0
+    ticker_summary = ticker_summary.sort_values(["flagged", "candidate_addback"], ascending=[False, False])
+
+    flagged_tickers = set(ticker_summary.loc[ticker_summary["flagged"], "ticker"])
+    details["ticker_flagged"] = details["ticker"].isin(flagged_tickers)
+    details = details.sort_values(["ticker_flagged", "midpoint_gap"], ascending=[False, False])
+    return details, ticker_summary, pd.DataFrame(errors)
+
+
+def find_bad_itm_upday_call_spreads(options, quotes, max_call_width=10.0):
     calls = options[options["option_type"] == "CALL"].copy()
     qmap = quotes.set_index("ticker").to_dict("index")
     rows = []
@@ -312,6 +445,11 @@ def find_bad_itm_upday_call_spreads(options, quotes):
                     continue
 
                 lower = long_leg["strike"]
+                width = upper - lower
+                if width <= 0 or width > max_call_width:
+                    # Width-excluded: do not consume; try next (wider) long
+                    # which will also be excluded, leaving short unmatched.
+                    continue
                 long_day_pl = long_leg["day_pl"] * contracts / long_leg["original_qty"]
                 short_day_pl = short_leg["day_pl"] * contracts / short_leg["original_qty"]
                 actual = long_day_pl + short_day_pl
@@ -326,6 +464,7 @@ def find_bad_itm_upday_call_spreads(options, quotes):
                         "ticker": ticker,
                         "expiration": exp,
                         "spread": f"{lower:g}/{upper:g} C",
+                        "width": width,
                         "contracts": contracts,
                         "stock_change": stock_chg,
                         "long_day_pl": long_day_pl,
@@ -721,6 +860,10 @@ def main():
     ap.add_argument("--risk-free-rate", type=float, default=0.045)
     ap.add_argument("--dividend-yield", type=float, default=0.0)
     ap.add_argument("--use-yf-delta-only", action="store_true")
+    ap.add_argument("--max-call-width", type=float, default=10.0)
+    ap.add_argument("--baseline-min-excess", type=float, default=10000.0)
+    ap.add_argument("--cboe-timeout", type=float, default=15.0)
+    ap.add_argument("--no-cboe-audit", action="store_true")
     args = ap.parse_args()
 
     outdir = Path(args.outdir)
@@ -731,7 +874,17 @@ def main():
     quotes = get_quotes(sorted(options["ticker"].unique()))
     naked_puts, put_spread_legs = split_short_puts_and_spreads(options)
 
-    bad_calls = find_bad_itm_upday_call_spreads(options, quotes)
+    bad_calls = find_bad_itm_upday_call_spreads(options, quotes, max_call_width=args.max_call_width)
+    if args.no_cboe_audit:
+        call_quote_details = pd.DataFrame()
+        call_quote_summary = pd.DataFrame()
+        call_quote_errors = pd.DataFrame()
+    else:
+        call_quote_details, call_quote_summary, call_quote_errors = audit_call_day_pl_baselines(
+            options,
+            min_excess=args.baseline_min_excess,
+            timeout=args.cboe_timeout,
+        )
     puts = check_otm_short_puts(
         naked_puts,
         quotes,
@@ -747,7 +900,29 @@ def main():
         prefer_csv_delta=(not args.use_yf_delta_only),
     )
 
-    call_addback = 0.0 if bad_calls.empty else float(pd.to_numeric(bad_calls["diff_to_add_back"], errors="coerce").fillna(0).sum())
+    intrinsic_call_addback = 0.0 if bad_calls.empty else float(pd.to_numeric(bad_calls["diff_to_add_back"], errors="coerce").fillna(0).sum())
+    baseline_call_addback = (
+        0.0
+        if call_quote_summary.empty
+        else float(pd.to_numeric(call_quote_summary["candidate_addback"], errors="coerce").fillna(0).sum())
+    )
+
+    intrinsic_by_ticker = (
+        pd.Series(dtype=float)
+        if bad_calls.empty
+        else bad_calls.groupby("ticker")["diff_to_add_back"].sum()
+    )
+    baseline_by_ticker = (
+        pd.Series(dtype=float)
+        if call_quote_summary.empty
+        else call_quote_summary.set_index("ticker")["candidate_addback"]
+    )
+    call_adjustment_by_ticker = pd.concat(
+        [intrinsic_by_ticker.rename("intrinsic"), baseline_by_ticker.rename("baseline")],
+        axis=1,
+    ).fillna(0.0)
+    call_adjustment_by_ticker["deduplicated_call_adjustment"] = call_adjustment_by_ticker[["intrinsic", "baseline"]].max(axis=1)
+    call_addback = float(call_adjustment_by_ticker["deduplicated_call_adjustment"].sum())
     if puts.empty:
         put_addback = 0.0
     else:
@@ -761,21 +936,29 @@ def main():
 
     total = call_addback + put_addback + put_spread_addback
     summary = pd.DataFrame([
-        {"bucket": "ITM call spreads intrinsic adjustment", "count": len(bad_calls), "addback": call_addback},
+        {"bucket": "ITM call spreads intrinsic adjustment (diagnostic)", "count": len(bad_calls), "addback": intrinsic_call_addback},
+        {"bucket": "Cboe call baseline anomaly (diagnostic)", "count": 0 if call_quote_summary.empty else int(call_quote_summary["flagged"].sum()), "addback": baseline_call_addback},
+        {"bucket": "CALL ADJUSTMENT (deduplicated)", "count": len(call_adjustment_by_ticker), "addback": call_addback},
         {"bucket": "OTM naked short puts delta check", "count": len(puts), "addback": put_addback},
         {"bucket": "OTM up-day put spreads", "count": len(put_spreads), "addback": put_spread_addback},
-        {"bucket": "TOTAL", "count": len(bad_calls) + len(puts) + len(put_spreads), "addback": total},
+        {"bucket": "TOTAL", "count": len(call_adjustment_by_ticker) + len(puts) + len(put_spreads), "addback": total},
     ])
 
     bad_calls_path = outdir / "bad_itm_upday_call_spreads.csv"
     puts_path = outdir / "otm_short_put_delta_check.csv"
     put_spreads_path = outdir / "otm_upday_put_spreads.csv"
+    call_quote_details_path = outdir / "call_quote_baseline_details.csv"
+    call_quote_summary_path = outdir / "call_quote_baseline_summary.csv"
+    call_quote_errors_path = outdir / "call_quote_baseline_errors.csv"
     summary_path = outdir / "final_noise_summary.csv"
     xlsx_path = outdir / "final_portfolio_noise_report.xlsx"
 
     bad_calls.to_csv(bad_calls_path, index=False)
     puts.to_csv(puts_path, index=False)
     put_spreads.to_csv(put_spreads_path, index=False)
+    call_quote_details.to_csv(call_quote_details_path, index=False)
+    call_quote_summary.to_csv(call_quote_summary_path, index=False)
+    call_quote_errors.to_csv(call_quote_errors_path, index=False)
     summary.to_csv(summary_path, index=False)
 
     with pd.ExcelWriter(xlsx_path, engine="openpyxl") as w:
@@ -783,6 +966,9 @@ def main():
         bad_calls.to_excel(w, index=False, sheet_name="ITM Call Adjustments")
         puts.to_excel(w, index=False, sheet_name="OTM Naked Short Puts")
         put_spreads.to_excel(w, index=False, sheet_name="OTM Up-Day Put Spreads")
+        call_quote_summary.to_excel(w, index=False, sheet_name="Call Baseline Summary")
+        call_quote_details.to_excel(w, index=False, sheet_name="Call Baseline Detail")
+        call_quote_errors.to_excel(w, index=False, sheet_name="Cboe Errors")
         quotes.to_excel(w, index=False, sheet_name="Quotes")
         options.to_excel(w, index=False, sheet_name="Parsed Options")
 
@@ -790,17 +976,36 @@ def main():
     print("=" * 72)
 
     print("\nCALL SPREAD RULE:")
-    print("  Negative day P/L with stock above the short strike; stock up OR both closes above the short strike.")
+    print(f"  Negative day P/L with stock above the short strike; width <= ${args.max_call_width:g}; stock up OR both closes above the short strike.")
     print("  Intrinsic-based scenario adjustment; does not establish that broker marks are wrong.")
     if bad_calls.empty:
         print("  No qualifying ITM call-spread losses found.")
     else:
-        cols = ["ticker", "expiration", "spread", "contracts", "stock_change", "schwab_net_day_pl", "intrinsic_expected_day_pl", "diff_to_add_back"]
+        cols = ["ticker", "expiration", "spread", "width", "contracts", "stock_change", "schwab_net_day_pl", "intrinsic_expected_day_pl", "diff_to_add_back"]
         print(bad_calls[cols].to_string(index=False))
-        print(f"\n  Call-spread add-back: ${call_addback:,.2f}")
+        print(f"\n  Intrinsic call-spread adjustment: ${intrinsic_call_addback:,.2f}")
+
+    print("\nCALL QUOTE-BASELINE AUDIT:")
+    print("  Flags only when Schwab call P/L is materially worse than both Cboe midpoint P/L and Cboe delta P/L.")
+    if args.no_cboe_audit:
+        print("  Skipped by --no-cboe-audit.")
+    elif call_quote_summary.empty:
+        print("  No call books could be audited against Cboe.")
+    else:
+        flagged = call_quote_summary[call_quote_summary["flagged"]]
+        if flagged.empty:
+            print("  No corroborated call baseline anomalies found.")
+        else:
+            cols = ["ticker", "positions", "schwab_call_day_pl", "cboe_mid_call_day_pl", "delta_expected_call_day_pl", "candidate_addback"]
+            print(flagged[cols].to_string(index=False))
+            print(f"\n  Cboe baseline candidate adjustment: ${baseline_call_addback:,.2f}")
+        if not call_quote_errors.empty:
+            print(f"  Cboe audit unavailable for {len(call_quote_errors)} ticker(s); see {call_quote_errors_path}.")
+
+    print(f"\n  Deduplicated call adjustment: ${call_addback:,.2f}")
 
     print("\nSHORT PUT RULE:")
-    print("  OTM naked short puts only, expected P/L = abs(delta) × stock_change × contracts × 100.")
+    print("  OTM naked short puts only, expected P/L = abs(delta) x stock_change x contracts x 100.")
     if puts.empty:
         print("  No OTM naked short puts found.")
     else:
@@ -825,6 +1030,9 @@ def main():
     print(f"  {bad_calls_path}")
     print(f"  {puts_path}")
     print(f"  {put_spreads_path}")
+    print(f"  {call_quote_details_path}")
+    print(f"  {call_quote_summary_path}")
+    print(f"  {call_quote_errors_path}")
     print(f"  {summary_path}")
     print(f"  {xlsx_path}")
 
