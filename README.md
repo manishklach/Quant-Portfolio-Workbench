@@ -2,7 +2,7 @@
 
 Local Python utilities for analyzing a Schwab portfolio export on your own machine. The current workflows in this repo have been tested against a Schwab portfolio CSV export format.
 
-The current primary script in this repo is `final_portfolio_noise_checker_v2.py`. It is a mark-noise and sanity-check tool, not an official P/L calculator, accounting system, or tax report. Its purpose is to help reconcile Schwab's displayed option day P/L against simpler economic checks for a narrow set of call spreads and short puts.
+The current primary script in this repo is `final_portfolio_noise_checker_v2.py`. It is a mark-noise and sanity-check tool, not an official P/L calculator, accounting system, or tax report. Its purpose is to reconcile Schwab's displayed option day P/L against intrinsic, delta, and Cboe quote-baseline checks for calls, short puts, and put spreads.
 
 ## Quick Start
 
@@ -104,10 +104,12 @@ python.exe .\portfolio_growth_plan.py --list-presets
 
 ## What This Tool Is
 
-`final_portfolio_noise_checker_v2.py` looks for two specific situations:
+`final_portfolio_noise_checker_v2.py` looks for four specific situations:
 
 1. Same-expiration vertical call spreads that should have clean intrinsic behavior but Schwab shows a negative day P/L.
 2. Out-of-the-money short puts where a simple delta-based expected P/L can be compared to Schwab's displayed day P/L.
+3. Out-of-the-money put spreads whose displayed P/L conflicts with their net-delta expectation.
+4. Negative call or put books whose Schwab day P/L is materially worse than both Cboe midpoint history and aggregate Cboe delta P/L. This catches baseline anomalies in ITM positions such as a large TQQQ put spread.
 
 It then estimates a clean add-back for apparent mark noise.
 
@@ -457,12 +459,16 @@ Tickers already present in the holdings CSV are marked with `*` in the blueprint
 
 ### Overview
 
-The script parses option rows from a Schwab holdings CSV, fetches stock quotes, and applies two separate rule sets:
+The script parses option rows from a Schwab holdings CSV, fetches stock and option quotes, and applies complementary rule sets:
 
 - intrinsic-only logic for qualifying ITM same-expiration vertical call spreads
 - delta-based logic for qualifying OTM short puts
+- net-delta logic for qualifying OTM put spreads
+- Cboe midpoint and aggregate-delta baseline auditing for negative call and put books, regardless of moneyness
 
-It writes both CSV and Excel outputs and prints a terminal summary including `TOTAL CLEAN ADD-BACK`.
+Cross-source baseline anomalies are counted only when both the Cboe midpoint comparison and delta comparison corroborate the excess loss. Call and put adjustments are deduplicated by ticker before the final total.
+
+It writes both CSV and Excel outputs and prints a terminal summary including `TOTAL MODEL ADD-BACK`.
 
 ### ITM Call-Spread Rule
 
@@ -663,14 +669,22 @@ The script writes these files:
 
 - `bad_itm_upday_call_spreads.csv`
 - `otm_short_put_delta_check.csv`
+- `otm_upday_put_spreads.csv`
+- `option_quote_baseline_details.csv`
+- `option_quote_baseline_summary.csv`
+- `option_quote_baseline_errors.csv`
 - `final_noise_summary.csv`
 - `final_portfolio_noise_report.xlsx`
 
 Excel workbook sheets:
 
 - `Summary`
-- `Bad ITM Up-Day Calls`
-- `OTM Short Puts`
+- `ITM Call Adjustments`
+- `OTM Naked Short Puts`
+- `OTM Up-Day Put Spreads`
+- `Option Baseline Summary`
+- `Option Baseline Detail`
+- `Cboe Errors`
 - `Quotes`
 - `Parsed Options`
 

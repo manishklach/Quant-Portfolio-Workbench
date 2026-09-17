@@ -34,8 +34,8 @@ PUT SPREADS:
     - stock day change > 0
     - net spread day P/L < net-delta expectation
 
-CALL QUOTE-BASELINE AUDIT:
-  - checks every call, including standalone and wide-spread legs
+OPTION QUOTE-BASELINE AUDIT:
+  - checks every call and put, including standalone and spread legs
   - compares Schwab day P/L with Cboe midpoint-vs-prior-close P/L
   - corroborates the discrepancy with aggregate Cboe delta exposure
   - flags a ticker only when Schwab is materially more negative than both checks
@@ -291,20 +291,20 @@ def fetch_cboe_chain(ticker, timeout=15.0):
     return payload.get("data", {})
 
 
-def audit_call_day_pl_baselines(options, min_excess=10000.0, timeout=15.0):
-    """Find call books whose reported loss is unsupported by both Cboe marks and delta."""
-    calls = options[options["option_type"] == "CALL"].copy()
+def audit_option_day_pl_baselines(options, min_excess=10000.0, timeout=15.0):
+    """Find option books whose reported loss is unsupported by Cboe marks and delta."""
     detail_rows = []
     errors = []
 
     groups = {
-        ticker: group
-        for ticker, group in calls.groupby("ticker")
+        (ticker, option_type): group
+        for (ticker, option_type), group in options.groupby(["ticker", "option_type"])
         if float(group["day_pl"].sum()) < 0
     }
+    tickers = sorted({ticker for ticker, _ in groups})
     chains = {}
-    with ThreadPoolExecutor(max_workers=min(8, max(len(groups), 1))) as pool:
-        futures = {pool.submit(fetch_cboe_chain, ticker, timeout): ticker for ticker in groups}
+    with ThreadPoolExecutor(max_workers=min(8, max(len(tickers), 1))) as pool:
+        futures = {pool.submit(fetch_cboe_chain, ticker, timeout): ticker for ticker in tickers}
         for future in as_completed(futures):
             ticker = futures[future]
             try:
@@ -312,7 +312,7 @@ def audit_call_day_pl_baselines(options, min_excess=10000.0, timeout=15.0):
             except Exception as exc:
                 errors.append({"ticker": ticker, "cboe_error": str(exc)})
 
-    for ticker, group in groups.items():
+    for (ticker, option_type), group in groups.items():
         if ticker not in chains:
             continue
         try:
@@ -350,8 +350,9 @@ def audit_call_day_pl_baselines(options, min_excess=10000.0, timeout=15.0):
             )
             detail_rows.append({
                 "ticker": ticker,
+                "option_type": option_type,
                 "expiration": row["expiration"],
-                "call": f"{float(row['strike']):g} C",
+                "contract": f"{float(row['strike']):g} {'C' if option_type == 'CALL' else 'P'}",
                 "quantity": quantity,
                 "schwab_mark": broker_mark,
                 "cboe_bid": bid,
@@ -373,26 +374,31 @@ def audit_call_day_pl_baselines(options, min_excess=10000.0, timeout=15.0):
     if details.empty:
         return details, pd.DataFrame(), pd.DataFrame(errors)
 
-    ticker_summary = details.groupby("ticker", as_index=False).agg(
-        positions=("call", "count"),
-        schwab_call_day_pl=("schwab_day_pl", "sum"),
-        cboe_mid_call_day_pl=("cboe_mid_day_pl", "sum"),
-        delta_expected_call_day_pl=("delta_expected_day_pl", "sum"),
+    ticker_summary = details.groupby(["ticker", "option_type"], as_index=False).agg(
+        positions=("contract", "count"),
+        schwab_day_pl=("schwab_day_pl", "sum"),
+        cboe_mid_day_pl=("cboe_mid_day_pl", "sum"),
+        delta_expected_day_pl=("delta_expected_day_pl", "sum"),
         midpoint_gap=("midpoint_gap", "sum"),
         delta_gap=("delta_gap", "sum"),
     )
     ticker_summary["candidate_addback"] = ticker_summary[["midpoint_gap", "delta_gap"]].min(axis=1).clip(lower=0)
     ticker_summary["flagged"] = (
-        (ticker_summary["schwab_call_day_pl"] < 0)
+        (ticker_summary["schwab_day_pl"] < 0)
         & (ticker_summary["midpoint_gap"] >= min_excess)
         & (ticker_summary["delta_gap"] >= min_excess)
     )
     ticker_summary.loc[~ticker_summary["flagged"], "candidate_addback"] = 0.0
     ticker_summary = ticker_summary.sort_values(["flagged", "candidate_addback"], ascending=[False, False])
 
-    flagged_tickers = set(ticker_summary.loc[ticker_summary["flagged"], "ticker"])
-    details["ticker_flagged"] = details["ticker"].isin(flagged_tickers)
-    details = details.sort_values(["ticker_flagged", "midpoint_gap"], ascending=[False, False])
+    flagged_books = set(
+        ticker_summary.loc[ticker_summary["flagged"], ["ticker", "option_type"]].itertuples(index=False, name=None)
+    )
+    details["book_flagged"] = [
+        (ticker, option_type) in flagged_books
+        for ticker, option_type in zip(details["ticker"], details["option_type"])
+    ]
+    details = details.sort_values(["book_flagged", "midpoint_gap"], ascending=[False, False])
     return details, ticker_summary, pd.DataFrame(errors)
 
 
@@ -876,11 +882,11 @@ def main():
 
     bad_calls = find_bad_itm_upday_call_spreads(options, quotes, max_call_width=args.max_call_width)
     if args.no_cboe_audit:
-        call_quote_details = pd.DataFrame()
-        call_quote_summary = pd.DataFrame()
-        call_quote_errors = pd.DataFrame()
+        option_quote_details = pd.DataFrame()
+        option_quote_summary = pd.DataFrame()
+        option_quote_errors = pd.DataFrame()
     else:
-        call_quote_details, call_quote_summary, call_quote_errors = audit_call_day_pl_baselines(
+        option_quote_details, option_quote_summary, option_quote_errors = audit_option_day_pl_baselines(
             options,
             min_excess=args.baseline_min_excess,
             timeout=args.cboe_timeout,
@@ -901,24 +907,26 @@ def main():
     )
 
     intrinsic_call_addback = 0.0 if bad_calls.empty else float(pd.to_numeric(bad_calls["diff_to_add_back"], errors="coerce").fillna(0).sum())
-    baseline_call_addback = (
-        0.0
-        if call_quote_summary.empty
-        else float(pd.to_numeric(call_quote_summary["candidate_addback"], errors="coerce").fillna(0).sum())
-    )
+    if option_quote_summary.empty:
+        baseline_call_by_ticker = pd.Series(dtype=float)
+        baseline_put_by_ticker = pd.Series(dtype=float)
+    else:
+        baseline_call_by_ticker = option_quote_summary.loc[
+            option_quote_summary["option_type"] == "CALL"
+        ].set_index("ticker")["candidate_addback"]
+        baseline_put_by_ticker = option_quote_summary.loc[
+            option_quote_summary["option_type"] == "PUT"
+        ].set_index("ticker")["candidate_addback"]
+    baseline_call_addback = float(baseline_call_by_ticker.sum())
+    baseline_put_addback = float(baseline_put_by_ticker.sum())
 
     intrinsic_by_ticker = (
         pd.Series(dtype=float)
         if bad_calls.empty
         else bad_calls.groupby("ticker")["diff_to_add_back"].sum()
     )
-    baseline_by_ticker = (
-        pd.Series(dtype=float)
-        if call_quote_summary.empty
-        else call_quote_summary.set_index("ticker")["candidate_addback"]
-    )
     call_adjustment_by_ticker = pd.concat(
-        [intrinsic_by_ticker.rename("intrinsic"), baseline_by_ticker.rename("baseline")],
+        [intrinsic_by_ticker.rename("intrinsic"), baseline_call_by_ticker.rename("baseline")],
         axis=1,
     ).fillna(0.0)
     call_adjustment_by_ticker["deduplicated_call_adjustment"] = call_adjustment_by_ticker[["intrinsic", "baseline"]].max(axis=1)
@@ -934,31 +942,60 @@ def main():
         put_spreads["positive_addback"] = pd.to_numeric(put_spreads["diff_to_add_back"], errors="coerce").clip(lower=0)
         put_spread_addback = float(put_spreads["positive_addback"].fillna(0).sum())
 
-    total = call_addback + put_addback + put_spread_addback
+    naked_put_by_ticker = (
+        pd.Series(dtype=float)
+        if puts.empty
+        else puts.groupby("ticker")["positive_addback"].sum()
+    )
+    put_spread_by_ticker = (
+        pd.Series(dtype=float)
+        if put_spreads.empty
+        else put_spreads.groupby("ticker")["positive_addback"].sum()
+    )
+    put_model_by_ticker = pd.concat(
+        [naked_put_by_ticker.rename("naked"), put_spread_by_ticker.rename("spread")],
+        axis=1,
+    ).fillna(0.0).sum(axis=1)
+    put_adjustment_by_ticker = pd.concat(
+        [put_model_by_ticker.rename("model"), baseline_put_by_ticker.rename("baseline")],
+        axis=1,
+    ).fillna(0.0)
+    put_adjustment_by_ticker["deduplicated_put_adjustment"] = put_adjustment_by_ticker[["model", "baseline"]].max(axis=1)
+    put_adjustment = float(put_adjustment_by_ticker["deduplicated_put_adjustment"].sum())
+
+    baseline_call_count = 0 if option_quote_summary.empty else int(
+        ((option_quote_summary["option_type"] == "CALL") & option_quote_summary["flagged"]).sum()
+    )
+    baseline_put_count = 0 if option_quote_summary.empty else int(
+        ((option_quote_summary["option_type"] == "PUT") & option_quote_summary["flagged"]).sum()
+    )
+    total = call_addback + put_adjustment
     summary = pd.DataFrame([
         {"bucket": "ITM call spreads intrinsic adjustment (diagnostic)", "count": len(bad_calls), "addback": intrinsic_call_addback},
-        {"bucket": "Cboe call baseline anomaly (diagnostic)", "count": 0 if call_quote_summary.empty else int(call_quote_summary["flagged"].sum()), "addback": baseline_call_addback},
+        {"bucket": "Cboe call baseline anomaly (diagnostic)", "count": baseline_call_count, "addback": baseline_call_addback},
         {"bucket": "CALL ADJUSTMENT (deduplicated)", "count": len(call_adjustment_by_ticker), "addback": call_addback},
         {"bucket": "OTM naked short puts delta check", "count": len(puts), "addback": put_addback},
         {"bucket": "OTM up-day put spreads", "count": len(put_spreads), "addback": put_spread_addback},
-        {"bucket": "TOTAL", "count": len(call_adjustment_by_ticker) + len(puts) + len(put_spreads), "addback": total},
+        {"bucket": "Cboe put baseline anomaly (diagnostic)", "count": baseline_put_count, "addback": baseline_put_addback},
+        {"bucket": "PUT ADJUSTMENT (deduplicated)", "count": len(put_adjustment_by_ticker), "addback": put_adjustment},
+        {"bucket": "TOTAL", "count": len(call_adjustment_by_ticker) + len(put_adjustment_by_ticker), "addback": total},
     ])
 
     bad_calls_path = outdir / "bad_itm_upday_call_spreads.csv"
     puts_path = outdir / "otm_short_put_delta_check.csv"
     put_spreads_path = outdir / "otm_upday_put_spreads.csv"
-    call_quote_details_path = outdir / "call_quote_baseline_details.csv"
-    call_quote_summary_path = outdir / "call_quote_baseline_summary.csv"
-    call_quote_errors_path = outdir / "call_quote_baseline_errors.csv"
+    option_quote_details_path = outdir / "option_quote_baseline_details.csv"
+    option_quote_summary_path = outdir / "option_quote_baseline_summary.csv"
+    option_quote_errors_path = outdir / "option_quote_baseline_errors.csv"
     summary_path = outdir / "final_noise_summary.csv"
     xlsx_path = outdir / "final_portfolio_noise_report.xlsx"
 
     bad_calls.to_csv(bad_calls_path, index=False)
     puts.to_csv(puts_path, index=False)
     put_spreads.to_csv(put_spreads_path, index=False)
-    call_quote_details.to_csv(call_quote_details_path, index=False)
-    call_quote_summary.to_csv(call_quote_summary_path, index=False)
-    call_quote_errors.to_csv(call_quote_errors_path, index=False)
+    option_quote_details.to_csv(option_quote_details_path, index=False)
+    option_quote_summary.to_csv(option_quote_summary_path, index=False)
+    option_quote_errors.to_csv(option_quote_errors_path, index=False)
     summary.to_csv(summary_path, index=False)
 
     with pd.ExcelWriter(xlsx_path, engine="openpyxl") as w:
@@ -966,9 +1003,9 @@ def main():
         bad_calls.to_excel(w, index=False, sheet_name="ITM Call Adjustments")
         puts.to_excel(w, index=False, sheet_name="OTM Naked Short Puts")
         put_spreads.to_excel(w, index=False, sheet_name="OTM Up-Day Put Spreads")
-        call_quote_summary.to_excel(w, index=False, sheet_name="Call Baseline Summary")
-        call_quote_details.to_excel(w, index=False, sheet_name="Call Baseline Detail")
-        call_quote_errors.to_excel(w, index=False, sheet_name="Cboe Errors")
+        option_quote_summary.to_excel(w, index=False, sheet_name="Option Baseline Summary")
+        option_quote_details.to_excel(w, index=False, sheet_name="Option Baseline Detail")
+        option_quote_errors.to_excel(w, index=False, sheet_name="Cboe Errors")
         quotes.to_excel(w, index=False, sheet_name="Quotes")
         options.to_excel(w, index=False, sheet_name="Parsed Options")
 
@@ -985,22 +1022,23 @@ def main():
         print(bad_calls[cols].to_string(index=False))
         print(f"\n  Intrinsic call-spread adjustment: ${intrinsic_call_addback:,.2f}")
 
-    print("\nCALL QUOTE-BASELINE AUDIT:")
-    print("  Flags only when Schwab call P/L is materially worse than both Cboe midpoint P/L and Cboe delta P/L.")
+    print("\nOPTION QUOTE-BASELINE AUDIT:")
+    print("  Flags call or put books only when Schwab P/L is materially worse than both Cboe midpoint P/L and Cboe delta P/L.")
     if args.no_cboe_audit:
         print("  Skipped by --no-cboe-audit.")
-    elif call_quote_summary.empty:
-        print("  No call books could be audited against Cboe.")
+    elif option_quote_summary.empty:
+        print("  No option books could be audited against Cboe.")
     else:
-        flagged = call_quote_summary[call_quote_summary["flagged"]]
+        flagged = option_quote_summary[option_quote_summary["flagged"]]
         if flagged.empty:
-            print("  No corroborated call baseline anomalies found.")
+            print("  No corroborated option baseline anomalies found.")
         else:
-            cols = ["ticker", "positions", "schwab_call_day_pl", "cboe_mid_call_day_pl", "delta_expected_call_day_pl", "candidate_addback"]
+            cols = ["ticker", "option_type", "positions", "schwab_day_pl", "cboe_mid_day_pl", "delta_expected_day_pl", "candidate_addback"]
             print(flagged[cols].to_string(index=False))
-            print(f"\n  Cboe baseline candidate adjustment: ${baseline_call_addback:,.2f}")
-        if not call_quote_errors.empty:
-            print(f"  Cboe audit unavailable for {len(call_quote_errors)} ticker(s); see {call_quote_errors_path}.")
+            print(f"\n  Cboe call baseline candidate adjustment: ${baseline_call_addback:,.2f}")
+            print(f"  Cboe put baseline candidate adjustment:  ${baseline_put_addback:,.2f}")
+        if not option_quote_errors.empty:
+            print(f"  Cboe audit unavailable for {len(option_quote_errors)} ticker(s); see {option_quote_errors_path}.")
 
     print(f"\n  Deduplicated call adjustment: ${call_addback:,.2f}")
 
@@ -1022,6 +1060,8 @@ def main():
         print(put_spreads[cols].to_string(index=False))
         print(f"\n  Put-spread positive add-back: ${put_spread_addback:,.2f}")
 
+    print(f"\n  Deduplicated put adjustment: ${put_adjustment:,.2f}")
+
     print("\nSUMMARY")
     print(summary.to_string(index=False))
     print(f"\nTOTAL MODEL ADD-BACK: ${total:,.2f}")
@@ -1030,9 +1070,9 @@ def main():
     print(f"  {bad_calls_path}")
     print(f"  {puts_path}")
     print(f"  {put_spreads_path}")
-    print(f"  {call_quote_details_path}")
-    print(f"  {call_quote_summary_path}")
-    print(f"  {call_quote_errors_path}")
+    print(f"  {option_quote_details_path}")
+    print(f"  {option_quote_summary_path}")
+    print(f"  {option_quote_errors_path}")
     print(f"  {summary_path}")
     print(f"  {xlsx_path}")
 
