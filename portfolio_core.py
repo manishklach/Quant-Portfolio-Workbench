@@ -8,12 +8,47 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
+import yaml
 
 
 EXCLUDED_SYMBOLS = {"Account Total", "Cash & Cash Investments", "Positions Total"}
 OPTION_SYMBOL_RE = re.compile(
     r"^\s*(\S+)\s+(\d{2}/\d{2}/\d{4})\s+([0-9]+(?:\.[0-9]+)?)\s+([CP])\s*$"
 )
+CONFIG_FILENAME = "config.yaml"
+
+_config_cache: dict | None = None
+
+
+def config_path() -> Path:
+    """Path to the shared config.yaml next to this module."""
+    return Path(__file__).with_name(CONFIG_FILENAME)
+
+
+def load_config(path: str | Path | None = None) -> dict:
+    """Load config.yaml (cached). Missing file or keys -> empty dict; callers apply defaults."""
+    global _config_cache
+    if path is None and _config_cache is not None:
+        return _config_cache
+    cfg: dict = {}
+    try:
+        with open(config_path() if path is None else path, "r") as f:
+            cfg = yaml.safe_load(f) or {}
+    except (OSError, yaml.YAMLError):
+        cfg = {}
+    if path is None:
+        _config_cache = cfg
+    return cfg
+
+
+def config_value(dotted: str, default=None):
+    """Read a dotted config key, e.g. config_value("market.risk_free_rate", 0.045)."""
+    node = load_config()
+    for part in dotted.split("."):
+        if not isinstance(node, dict) or part not in node:
+            return default
+        node = node[part]
+    return node
 
 
 def clean_numeric(val) -> float:

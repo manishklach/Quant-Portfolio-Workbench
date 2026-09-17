@@ -51,7 +51,6 @@ Run:
 
 import argparse
 import json
-import math
 import re
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -61,10 +60,17 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
+from option_math import bs_put_delta, implied_volatility, normalize_put_delta
+from portfolio_core import config_value
+
 try:
     import yfinance as yf
 except ImportError:
     yf = None
+
+
+_RISK_FREE_RATE = float(config_value("market.risk_free_rate", 0.045))
+_DIVIDEND_YIELD = float(config_value("market.dividend_yield", 0.0))
 
 
 def read_broker_csv(path):
@@ -553,10 +559,6 @@ def split_short_puts_and_spreads(options):
     return pd.DataFrame(naked_rows), pd.DataFrame(spread_rows)
 
 
-def norm_cdf(x):
-    return 0.5 * (1.0 + math.erf(x / math.sqrt(2)))
-
-
 def year_frac(exp):
     try:
         e = pd.Timestamp(exp).to_pydatetime().replace(tzinfo=timezone.utc)
@@ -564,58 +566,6 @@ def year_frac(exp):
         return max((e - now).total_seconds() / 86400.0 / 365.0, 1 / 365)
     except Exception:
         return np.nan
-
-
-def bs_put_delta(S, K, T, r, sigma, q=0.0):
-    if any(pd.isna(v) for v in [S, K, T, r, sigma, q]) or S <= 0 or K <= 0 or T <= 0 or sigma <= 0:
-        return np.nan
-    d1 = (math.log(S / K) + (r - q + 0.5 * sigma * sigma) * T) / (sigma * math.sqrt(T))
-    return -math.exp(-q * T) * norm_cdf(-d1)
-
-
-def bs_option_price(S, K, T, r, sigma, opt_type, q=0.0):
-    if any(pd.isna(v) for v in [S, K, T, r, sigma, q]) or S <= 0 or K <= 0 or T <= 0 or sigma <= 0:
-        intrinsic = max(S - K, 0.0) if opt_type == "C" else max(K - S, 0.0)
-        return intrinsic
-    sqrt_t = math.sqrt(T)
-    d1 = (math.log(S / K) + (r - q + 0.5 * sigma * sigma) * T) / (sigma * sqrt_t)
-    d2 = d1 - sigma * sqrt_t
-    discounted_spot = S * math.exp(-q * T)
-    discounted_strike = K * math.exp(-r * T)
-    if opt_type == "C":
-        return discounted_spot * norm_cdf(d1) - discounted_strike * norm_cdf(d2)
-    return discounted_strike * norm_cdf(-d2) - discounted_spot * norm_cdf(-d1)
-
-
-def implied_volatility_from_price(target_price, S, K, T, r, opt_type, q=0.0):
-    if any(pd.isna(v) for v in [target_price, S, K, T, r, q]) or target_price <= 0 or S <= 0 or K <= 0 or T <= 0:
-        return np.nan
-    low = 1e-4
-    high = 5.0
-    low_price = bs_option_price(S, K, T, r, low, opt_type, q)
-    high_price = bs_option_price(S, K, T, r, high, opt_type, q)
-    if target_price < low_price - 1e-6 or target_price > high_price + 1e-6:
-        return np.nan
-    for _ in range(80):
-        mid = (low + high) / 2.0
-        mid_price = bs_option_price(S, K, T, r, mid, opt_type, q)
-        if abs(mid_price - target_price) < 1e-5:
-            return mid
-        if mid_price < target_price:
-            low = mid
-        else:
-            high = mid
-    return (low + high) / 2.0
-
-
-def normalize_put_delta(d):
-    if pd.isna(d):
-        return np.nan
-    d = float(d)
-    if abs(d) > 1.5 and abs(d) <= 100:
-        d /= 100.0
-    d = -abs(d)
-    return d if abs(d) <= 1.05 else np.nan
 
 
 def nearest_expiration(tk, target):
@@ -650,7 +600,7 @@ def fetch_yf_iv_for_put(ticker, expiration, strike):
         return np.nan, None, f"yf_error_{e}"
 
 
-def check_otm_short_puts(puts, quotes, risk_free_rate=0.045, dividend_yield=0.0, prefer_csv_delta=True):
+def check_otm_short_puts(puts, quotes, risk_free_rate=_RISK_FREE_RATE, dividend_yield=_DIVIDEND_YIELD, prefer_csv_delta=True):
     puts = puts.copy()
     qmap = quotes.set_index("ticker").to_dict("index")
     rows = []
@@ -684,7 +634,7 @@ def check_otm_short_puts(puts, quotes, risk_free_rate=0.045, dividend_yield=0.0,
         if pd.isna(delta):
             option_mark = float(row.get("price", np.nan))
             T = year_frac(row["expiration"])
-            mark_iv = implied_volatility_from_price(
+            mark_iv = implied_volatility(
                 option_mark,
                 last,
                 strike,
@@ -733,7 +683,7 @@ def check_otm_short_puts(puts, quotes, risk_free_rate=0.045, dividend_yield=0.0,
     return out
 
 
-def resolve_put_delta(ticker, expiration, strike, spot, csv_delta=np.nan, option_mark=np.nan, risk_free_rate=0.045, dividend_yield=0.0, prefer_csv_delta=True, iv_cache=None):
+def resolve_put_delta(ticker, expiration, strike, spot, csv_delta=np.nan, option_mark=np.nan, risk_free_rate=_RISK_FREE_RATE, dividend_yield=_DIVIDEND_YIELD, prefer_csv_delta=True, iv_cache=None):
     delta = np.nan
     delta_source = None
     yf_iv = np.nan
@@ -746,7 +696,7 @@ def resolve_put_delta(ticker, expiration, strike, spot, csv_delta=np.nan, option
 
     if pd.isna(delta):
         T = year_frac(expiration)
-        mark_iv = implied_volatility_from_price(
+        mark_iv = implied_volatility(
             float(option_mark) if not pd.isna(option_mark) else np.nan,
             spot,
             strike,
@@ -780,7 +730,7 @@ def resolve_put_delta(ticker, expiration, strike, spot, csv_delta=np.nan, option
     }
 
 
-def check_otm_put_spreads(spreads, quotes, risk_free_rate=0.045, dividend_yield=0.0, prefer_csv_delta=True):
+def check_otm_put_spreads(spreads, quotes, risk_free_rate=_RISK_FREE_RATE, dividend_yield=_DIVIDEND_YIELD, prefer_csv_delta=True):
     spreads = spreads.copy()
     qmap = quotes.set_index("ticker").to_dict("index")
     rows = []
@@ -863,8 +813,8 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("csv")
     ap.add_argument("--outdir", default=".")
-    ap.add_argument("--risk-free-rate", type=float, default=0.045)
-    ap.add_argument("--dividend-yield", type=float, default=0.0)
+    ap.add_argument("--risk-free-rate", type=float, default=_RISK_FREE_RATE)
+    ap.add_argument("--dividend-yield", type=float, default=_DIVIDEND_YIELD)
     ap.add_argument("--use-yf-delta-only", action="store_true")
     ap.add_argument("--max-call-width", type=float, default=10.0)
     ap.add_argument("--baseline-min-excess", type=float, default=10000.0)

@@ -1,7 +1,6 @@
 """Estimate approximate option portfolio sensitivity to implied-volatility crush scenarios."""
 
 import argparse
-import math
 from dataclasses import dataclass
 from datetime import datetime
 
@@ -9,6 +8,7 @@ import numpy as np
 import pandas as pd
 
 from portfolio_core import active_option_positions, default_csv_path, load_schwab_holdings
+from option_math import bs_price_vec, bs_vega_vec
 
 
 @dataclass
@@ -16,38 +16,6 @@ class FitParams:
     spot: float
     sigma: float
     used_points: int
-
-
-def norm_cdf(x):
-    x_arr = np.asarray(x, dtype=float)
-    erf_vec = np.vectorize(math.erf)
-    return 0.5 * (1.0 + erf_vec(x_arr / np.sqrt(2.0)))
-
-def bs_price_vec(spot, strike, t, r, sigma, opt_type_arr):
-    spot = np.maximum(spot, 1e-9)
-    strike = np.maximum(strike, 1e-9)
-    sigma = np.maximum(sigma, 1e-6)
-    t = np.maximum(t, 1e-9)
-
-    sqrt_t = np.sqrt(t)
-    d1 = (np.log(spot / strike) + (r + 0.5 * sigma ** 2) * t) / (sigma * sqrt_t)
-    d2 = d1 - sigma * sqrt_t
-
-    call_price = spot * norm_cdf(d1) - strike * np.exp(-r * t) * norm_cdf(d2)
-    put_price = strike * np.exp(-r * t) * norm_cdf(-d2) - spot * norm_cdf(-d1)
-    return np.where(opt_type_arr == 'C', call_price, put_price)
-
-
-def bs_vega_vec(spot, strike, t, r, sigma):
-    spot = np.maximum(spot, 1e-9)
-    strike = np.maximum(strike, 1e-9)
-    sigma = np.maximum(sigma, 1e-6)
-    t = np.maximum(t, 1e-9)
-
-    sqrt_t = np.sqrt(t)
-    d1 = (np.log(spot / strike) + (r + 0.5 * sigma ** 2) * t) / (sigma * sqrt_t)
-    pdf_d1 = (1.0 / np.sqrt(2.0 * np.pi)) * np.exp(-0.5 * d1 ** 2)
-    return spot * pdf_d1 * sqrt_t
 
 
 def fit_spot_sigma(group_df, r):

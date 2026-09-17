@@ -1,0 +1,24 @@
+# Quant Portfolio Workbench — shared assumptions.
+#
+# Single source of truth for portfolio targets, market assumptions, and
+# account parameters. Scripts read these via `portfolio_core.load_config()`
+# instead of hardcoding their own copies. Edit here; everything follows.
+#
+# Goal basis (Sep 2026): ~$16M net liquidation, +50% target (~$24M) by Sep 13, 2027.
+# Buying power was ~$16.5M (~1:1 with equity, essentially no margin in use) —
+# the dashboard's margin section still assumes 2x Reg-T buying power, so treat
+# its "margin used" line as a rough estimate until that math is revisited.
+
+portfolio:
+  equity_base: 16000000.0        # starting NAV for goal tracking
+  target_nav: 24000000.0         # +50% goal
+  goal_start_date: "2026-09-13"
+  goal_end_date: "2027-09-13"
+
+market:
+  risk_free_rate: 0.045          # used for Black-Scholes fallbacks
+  dividend_yield: 0.0            # override per-script with --dividend-yield where supported
+
+account:
+  # Approximate buying power last observed (Sep 13, 2026). Update from Schwab.
+  buying_power: 16500000.0

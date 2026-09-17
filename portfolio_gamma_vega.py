@@ -8,39 +8,7 @@ import numpy as np
 import pandas as pd
 
 from portfolio_core import active_option_positions, default_csv_path, load_schwab_holdings
-
-
-def norm_cdf(x):
-    x_arr = np.asarray(x, dtype=float)
-    erf_vec = np.vectorize(math.erf)
-    return 0.5 * (1.0 + erf_vec(x_arr / np.sqrt(2.0)))
-
-
-def bs_d1(spot, strike, t, r, sigma):
-    spot = np.maximum(np.asarray(spot, dtype=float), 1e-9)
-    strike = np.maximum(np.asarray(strike, dtype=float), 1e-9)
-    t = np.maximum(np.asarray(t, dtype=float), 1e-9)
-    sigma = np.maximum(np.asarray(sigma, dtype=float), 1e-6)
-    return (np.log(spot / strike) + (r + 0.5 * sigma**2) * t) / (sigma * np.sqrt(t))
-
-
-def bs_delta_vec(spot, strike, t, r, sigma, opt_type):
-    d1 = bs_d1(spot, strike, t, r, sigma)
-    call_delta = norm_cdf(d1)
-    put_delta = call_delta - 1.0
-    return np.where(np.asarray(opt_type) == "C", call_delta, put_delta)
-
-
-def bs_gamma_vec(spot, strike, t, r, sigma):
-    d1 = bs_d1(spot, strike, t, r, sigma)
-    pdf_d1 = (1.0 / np.sqrt(2.0 * np.pi)) * np.exp(-0.5 * d1**2)
-    return pdf_d1 / (np.maximum(np.asarray(spot, dtype=float), 1e-9) * np.maximum(np.asarray(sigma, dtype=float), 1e-6) * np.sqrt(np.maximum(np.asarray(t, dtype=float), 1e-9)))
-
-
-def bs_vega_vec(spot, strike, t, r, sigma):
-    d1 = bs_d1(spot, strike, t, r, sigma)
-    pdf_d1 = (1.0 / np.sqrt(2.0 * np.pi)) * np.exp(-0.5 * d1**2)
-    return np.asarray(spot, dtype=float) * pdf_d1 * np.sqrt(np.maximum(np.asarray(t, dtype=float), 1e-9))
+from option_math import bs_delta_vec, bs_gamma_vec, bs_vega_vec
 
 
 def compute_greeks(options, r):

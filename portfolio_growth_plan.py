@@ -2,9 +2,9 @@
 """Plan a path from current portfolio NAV to a target NAV over a fixed horizon.
 
 Examples:
-  python portfolio_growth_plan.py --current-nav 20000000 --target-nav 25000000 --end-date 2026-12-31
-  python portfolio_growth_plan.py --current-nav 20000000 --target-nav 25000000 --end-date 2026-12-31 --monthly-net-flow 50000
-  python portfolio_growth_plan.py --current-nav 20000000 --target-nav 25000000 --end-date 2026-12-31 ^
+  python portfolio_growth_plan.py --current-nav 16000000 --target-nav 24000000 --end-date 2027-09-13
+  python portfolio_growth_plan.py --current-nav 16000000 --target-nav 24000000 --end-date 2027-09-13 --monthly-net-flow 50000
+  python portfolio_growth_plan.py --current-nav 16000000 --target-nav 24000000 --end-date 2027-09-13 ^
       --sleeve "core_growth,12000000,1.0,0.18" ^
       --sleeve "income,5000000,1.0,0.10" ^
       --sleeve "tactical_margin,3000000,2.0,0.22"
@@ -18,7 +18,12 @@ import sys
 from dataclasses import dataclass
 from datetime import date, datetime
 
-from portfolio_core import default_csv_path, load_schwab_holdings
+from portfolio_core import config_value, default_csv_path, load_schwab_holdings
+
+
+_GOAL_EQUITY = float(config_value("portfolio.equity_base", 16_000_000.0))
+_GOAL_TARGET = float(config_value("portfolio.target_nav", 24_000_000.0))
+_GOAL_END = str(config_value("portfolio.goal_end_date", "2027-09-13"))
 
 
 @dataclass
@@ -372,8 +377,8 @@ def main() -> int:
     parser = argparse.ArgumentParser(
         description="Plan a path from a current portfolio NAV to a target NAV over a fixed horizon."
     )
-    parser.add_argument("--current-nav", type=float, required=True, help="Current total portfolio NAV.")
-    parser.add_argument("--target-nav", type=float, required=True, help="Target portfolio NAV.")
+    parser.add_argument("--current-nav", type=float, default=_GOAL_EQUITY, help="Current total portfolio NAV (default: config portfolio.equity_base).")
+    parser.add_argument("--target-nav", type=float, default=_GOAL_TARGET, help="Target portfolio NAV (default: config portfolio.target_nav).")
     parser.add_argument(
         "--start-date",
         default=None,
@@ -381,8 +386,8 @@ def main() -> int:
     )
     parser.add_argument(
         "--end-date",
-        required=True,
-        help="Target date in YYYY-MM-DD format.",
+        default=_GOAL_END,
+        help="Target date in YYYY-MM-DD format (default: config portfolio.goal_end_date).",
     )
     parser.add_argument(
         "--monthly-net-flow",

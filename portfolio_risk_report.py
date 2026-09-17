@@ -16,55 +16,16 @@ from portfolio_core import (
 )
 
 
+from option_math import (
+    bs_delta_vec,
+    bs_gamma_vec,
+    bs_theta_vec,
+    bs_vega_vec,
+)
+
+
 LIVE_QUOTE_WORKERS = 8
 LIVE_EQUITY_ASSET_TYPES = {"Equity", "ETFs & Closed End Funds", "Mutual Funds"}
-
-
-def norm_cdf(x):
-    return 0.5 * (1.0 + np.vectorize(__import__("math").erf)(np.asarray(x, dtype=float) / np.sqrt(2.0)))
-
-
-def bs_d1(spot, strike, t, r, sigma):
-    spot = np.maximum(np.asarray(spot, dtype=float), 1e-9)
-    strike = np.maximum(np.asarray(strike, dtype=float), 1e-9)
-    t = np.maximum(np.asarray(t, dtype=float), 1e-9)
-    sigma = np.maximum(np.asarray(sigma, dtype=float), 1e-6)
-    return (np.log(spot / strike) + (r + 0.5 * sigma**2) * t) / (sigma * np.sqrt(t))
-
-
-def bs_delta_vec(spot, strike, t, r, sigma, opt_type):
-    d1 = bs_d1(spot, strike, t, r, sigma)
-    call_delta = norm_cdf(d1)
-    put_delta = call_delta - 1.0
-    return np.where(np.asarray(opt_type) == "C", call_delta, put_delta)
-
-
-def bs_gamma_vec(spot, strike, t, r, sigma):
-    d1 = bs_d1(spot, strike, t, r, sigma)
-    pdf_d1 = (1.0 / np.sqrt(2.0 * np.pi)) * np.exp(-0.5 * d1**2)
-    return pdf_d1 / (np.maximum(np.asarray(spot, dtype=float), 1e-9) * np.maximum(np.asarray(sigma, dtype=float), 1e-6) * np.sqrt(np.maximum(np.asarray(t, dtype=float), 1e-9)))
-
-
-def bs_vega_vec(spot, strike, t, r, sigma):
-    d1 = bs_d1(spot, strike, t, r, sigma)
-    pdf_d1 = (1.0 / np.sqrt(2.0 * np.pi)) * np.exp(-0.5 * d1**2)
-    return np.asarray(spot, dtype=float) * pdf_d1 * np.sqrt(np.maximum(np.asarray(t, dtype=float), 1e-9))
-
-
-def bs_theta_vec(spot, strike, t, r, sigma, opt_type):
-    d1 = bs_d1(spot, strike, t, r, sigma)
-    d2 = d1 - np.maximum(np.asarray(sigma, dtype=float), 1e-6) * np.sqrt(np.maximum(np.asarray(t, dtype=float), 1e-9))
-    pdf_d1 = (1.0 / np.sqrt(2.0 * np.pi)) * np.exp(-0.5 * d1**2)
-    carry = r * np.asarray(strike, dtype=float) * np.exp(-r * np.maximum(np.asarray(t, dtype=float), 1e-9))
-    call_theta = (
-        -np.asarray(spot, dtype=float) * pdf_d1 * np.asarray(sigma, dtype=float) / (2.0 * np.sqrt(np.maximum(np.asarray(t, dtype=float), 1e-9)))
-        - carry * norm_cdf(d2)
-    )
-    put_theta = (
-        -np.asarray(spot, dtype=float) * pdf_d1 * np.asarray(sigma, dtype=float) / (2.0 * np.sqrt(np.maximum(np.asarray(t, dtype=float), 1e-9)))
-        + carry * norm_cdf(-d2)
-    )
-    return np.where(np.asarray(opt_type) == "C", call_theta, put_theta)
 
 
 def build_option_risk_frame(

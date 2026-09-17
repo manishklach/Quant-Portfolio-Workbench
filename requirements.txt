@@ -1,0 +1,11 @@
+# Runtime dependencies (see README Quick Start). Pins are lower bounds so a fresh
+# install works; upgrade deliberately and re-run the test suite.
+pandas>=2.1,<3
+numpy>=1.26,<3
+yfinance>=0.2.40
+openpyxl>=3.1
+pyyaml>=6.0
+requests>=2.31
+
+# Dev / test
+pytest>=8.0

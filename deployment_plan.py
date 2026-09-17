@@ -8,20 +8,21 @@ import sys
 from datetime import date, datetime, timedelta
 from pathlib import Path
 
-import numpy as np
 import pandas as pd
 import yfinance as yf
 
 from portfolio_core import (
     active_option_positions,
     clean_numeric,
+    config_value,
     default_csv_path,
     load_schwab_holdings,
 )
+from option_math import bs_call_delta, bs_price, bs_put_delta, norm_cdf
 
 SECTION_WIDTH = 100
-EQUITY = 20_000_000.0
-MARGIN_AVAILABLE = 27_000_000.0
+EQUITY = float(config_value("portfolio.equity_base", 16_000_000.0))
+MARGIN_AVAILABLE = float(config_value("account.buying_power", 16_500_000.0))
 
 CSP_TARGETS = ["QQQ", "XLK", "MSFT", "NVDA", "AVGO"]
 CSP_DELTA_TARGET = 0.12
@@ -29,37 +30,6 @@ CSP_DTE = 21
 CSP_NOTIONAL_TOTAL = 8_000_000.0
 CC_DELTA_TARGET = 0.15
 CC_DTE = 21
-
-
-def norm_cdf(x):
-    return 0.5 * (1.0 + np.vectorize(math.erf)(np.asarray(x, dtype=float) / math.sqrt(2.0)))
-
-
-def bs_put_price(spot, strike, t, r, sigma):
-    if t <= 0 or sigma <= 0 or spot <= 0:
-        return 0.0
-    d1 = (math.log(spot / strike) + (r + 0.5 * sigma ** 2) * t) / (sigma * math.sqrt(t))
-    d2 = d1 - sigma * math.sqrt(t)
-    return strike * math.exp(-r * t) * norm_cdf(-d2) - spot * norm_cdf(-d1)
-
-
-def bs_call_price(spot, strike, t, r, sigma):
-    if t <= 0 or sigma <= 0 or spot <= 0:
-        return 0.0
-    d1 = (math.log(spot / strike) + (r + 0.5 * sigma ** 2) * t) / (sigma * math.sqrt(t))
-    d2 = d1 - sigma * math.sqrt(t)
-    return spot * norm_cdf(d1) - strike * math.exp(-r * t) * norm_cdf(d2)
-
-
-def bs_call_delta(spot, strike, t, r, sigma):
-    if t <= 0 or sigma <= 0 or spot <= 0:
-        return 0.0
-    d1 = (math.log(spot / strike) + (r + 0.5 * sigma ** 2) * t) / (sigma * math.sqrt(t))
-    return norm_cdf(d1)
-
-
-def bs_put_delta(spot, strike, t, r, sigma):
-    return bs_call_delta(spot, strike, t, r, sigma) - 1.0
 
 
 def find_strike_for_delta(target_delta, spot, t, r, sigma, opt_type, lower_bound=0.3, upper_bound=3.0):
@@ -100,7 +70,7 @@ def get_iv(ticker: str) -> float | None:
             return None
         sigma = 0.3
         for _ in range(100):
-            price = bs_call_price(spot, strike, t, 0.04, sigma)
+            price = bs_price(spot, strike, t, 0.04, sigma, "C")
             diff = price - mid
             if abs(diff) < 0.001:
                 break
@@ -230,7 +200,7 @@ def get_csp_strikes(as_of: date) -> list[dict]:
             )
             if strike >= spot:
                 strike = round(spot * 0.85 / 2.5) * 2.5
-            premium = bs_put_price(spot, strike, t, r, sigma)
+            premium = bs_price(spot, strike, t, r, sigma, "P")
             notional = per_name_notional
             contracts = int(notional / (strike * 100))
             if contracts < 1:
@@ -285,7 +255,7 @@ def get_cc_strikes(df: pd.DataFrame, as_of: date) -> list[dict]:
             spot = float(hist["Close"].iloc[-1])
             sigma = get_iv(ticker) or 0.35
             strike = find_strike_for_delta(delta_target, spot, t, r, sigma, "C")
-            premium = bs_call_price(spot, strike, t, r, sigma)
+            premium = bs_price(spot, strike, t, r, sigma, "C")
             annualized = premium / spot * (365.0 / CC_DTE) * 100
 
             target_pct = 0.25
@@ -311,7 +281,7 @@ def get_cc_strikes(df: pd.DataFrame, as_of: date) -> list[dict]:
 
 def main():
     parser = argparse.ArgumentParser(description="Generate a concrete deployment plan.")
-    parser.add_argument("--current-nav", type=float, default=EQUITY, help="Current NAV (default: 20M)")
+    parser.add_argument("--current-nav", type=float, default=EQUITY, help="Current NAV (default: config portfolio.equity_base)")
     parser.add_argument("--target-nav", type=float, default=25_000_000, help="Target NAV (default: 25M)")
     parser.add_argument("--end-date", default="2026-12-31", help="Target date (default: 2026-12-31)")
     parser.add_argument("--file", default=None, help="Holdings CSV path")

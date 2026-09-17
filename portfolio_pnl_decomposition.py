@@ -9,62 +9,19 @@ import pandas as pd
 import yfinance as yf
 
 from portfolio_core import active_option_positions, default_csv_path, load_schwab_holdings
+from option_math import (
+    bs_delta_vec,
+    bs_gamma_vec,
+    bs_theta_vec,
+    bs_vega_vec,
+    norm_cdf,
+    norm_pdf,
+)
 
 
-def norm_cdf(x):
-    x_arr = np.asarray(x, dtype=float)
-    erf_vec = np.vectorize(math.erf)
-    return 0.5 * (1.0 + erf_vec(x_arr / np.sqrt(2.0)))
-
-
-def norm_pdf(x):
-    return (1.0 / np.sqrt(2.0 * np.pi)) * np.exp(-0.5 * np.asarray(x, dtype=float) ** 2)
-
-
-def bs_d1(spot, strike, t, r, sigma):
-    spot = np.maximum(np.asarray(spot, dtype=float), 1e-9)
-    strike = np.maximum(np.asarray(strike, dtype=float), 1e-9)
-    t = np.maximum(np.asarray(t, dtype=float), 1e-9)
-    sigma = np.maximum(np.asarray(sigma, dtype=float), 1e-6)
-    return (np.log(spot / strike) + (r + 0.5 * sigma ** 2) * t) / (sigma * np.sqrt(t))
-
-
-def bs_d2(spot, strike, t, r, sigma):
-    d1 = bs_d1(spot, strike, t, r, sigma)
-    return d1 - np.asarray(sigma, dtype=float) * np.sqrt(np.maximum(np.asarray(t, dtype=float), 1e-9))
-
-
-def bs_delta_vec(spot, strike, t, r, sigma, opt_type):
-    d1 = bs_d1(spot, strike, t, r, sigma)
-    call_delta = norm_cdf(d1)
-    put_delta = call_delta - 1.0
-    return np.where(np.asarray(opt_type) == "C", call_delta, put_delta)
-
-
-def bs_gamma_vec(spot, strike, t, r, sigma):
-    d1 = bs_d1(spot, strike, t, r, sigma)
-    pdf_d1 = norm_pdf(d1)
-    return pdf_d1 / (np.maximum(np.asarray(spot, dtype=float), 1e-9) * np.maximum(np.asarray(sigma, dtype=float), 1e-6) * np.sqrt(np.maximum(np.asarray(t, dtype=float), 1e-9)))
-
-
-def bs_vega_vec(spot, strike, t, r, sigma):
-    d1 = bs_d1(spot, strike, t, r, sigma)
-    pdf_d1 = norm_pdf(d1)
-    return np.asarray(spot, dtype=float) * pdf_d1 * np.sqrt(np.maximum(np.asarray(t, dtype=float), 1e-9))
-
-
-def bs_theta_vec(spot, strike, t, r, sigma, opt_type):
-    d1 = bs_d1(spot, strike, t, r, sigma)
-    d2 = bs_d2(spot, strike, t, r, sigma)
-    pdf_d1 = norm_pdf(d1)
-    sqrt_t = np.sqrt(np.maximum(np.asarray(t, dtype=float), 1e-9))
-    term1 = -(np.asarray(spot, dtype=float) * pdf_d1 * np.asarray(sigma, dtype=float)) / (2.0 * sqrt_t)
-    exp_rt = np.exp(-r * t)
-    opt = np.asarray(opt_type)
-    term2_call = r * np.asarray(strike, dtype=float) * exp_rt * norm_cdf(d2)
-    term2_put = -r * np.asarray(strike, dtype=float) * exp_rt * norm_cdf(-d2)
-    theta = term1 + np.where(opt == "C", -term2_call, -term2_put)
-    return theta / 365.0
+def _theta_vec_per_day(spot, strike, t, r, sigma, opt_type):
+    """Daily theta (canonical bs_theta_vec is per-year)."""
+    return bs_theta_vec(spot, strike, t, r, sigma, opt_type) / 365.0
 
 
 def compute_greeks(options, r):
@@ -84,7 +41,7 @@ def compute_greeks(options, r):
     delta = bs_delta_vec(spot, strike, t, r, sigma, opt_type)
     gamma = bs_gamma_vec(spot, strike, t, r, sigma)
     vega = bs_vega_vec(spot, strike, t, r, sigma)
-    theta = bs_theta_vec(spot, strike, t, r, sigma, opt_type)
+    theta = _theta_vec_per_day(spot, strike, t, r, sigma, opt_type)
 
     df["Delta $"] = qty * 100.0 * delta * spot
     df["Gamma $/1%"] = qty * 100.0 * gamma * spot * 0.01
@@ -166,7 +123,7 @@ def main():
         greeks.loc[idx, "Delta $"] = qty * 100.0 * bs_delta_vec(spot, strike, t, r, sigma, opt_t) * spot
         greeks.loc[idx, "Gamma $/1%"] = qty * 100.0 * bs_gamma_vec(spot, strike, t, r, sigma) * spot * 0.01
         greeks.loc[idx, "Vega $/1vol"] = qty * 100.0 * bs_vega_vec(spot, strike, t, r, sigma) * 0.01
-        greeks.loc[idx, "Theta $/day"] = qty * 100.0 * bs_theta_vec(spot, strike, t, r, sigma, opt_t)
+        greeks.loc[idx, "Theta $/day"] = qty * 100.0 * _theta_vec_per_day(spot, strike, t, r, sigma, opt_t)
 
     # Add stock/ETF positions as delta-only positions
     stock_rows = []

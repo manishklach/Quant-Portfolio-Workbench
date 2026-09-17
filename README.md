@@ -9,7 +9,13 @@ The current primary script in this repo is `final_portfolio_noise_checker_v2.py`
 Install dependencies:
 
 ```powershell
-python -m pip install pandas yfinance numpy openpyxl requests
+python -m pip install -r requirements.txt
+```
+
+Run the test suite (covers option math, Schwab parsing, and shared config):
+
+```powershell
+python -m pytest tests/
 ```
 
 Run the latest checker against a Schwab holdings CSV:
@@ -90,10 +96,16 @@ Run the Nasdaq-100 quant model backtest:
 python.exe .\nasdaq100_quant_model.py backtest --years 5 --top 12
 ```
 
-Plan a path from current NAV to a target NAV with strategy sleeves:
+Plan a path from current NAV to a target NAV with strategy sleeves (defaults come from `config.yaml`):
 
 ```powershell
-python.exe .\portfolio_growth_plan.py --current-nav 20000000 --target-nav 25000000 --end-date 2026-12-31
+python.exe .\portfolio_growth_plan.py
+```
+
+Override the goal explicitly:
+
+```powershell
+python.exe .\portfolio_growth_plan.py --current-nav 16000000 --target-nav 24000000 --end-date 2027-09-13
 ```
 
 List built-in strategy presets:
@@ -101,6 +113,46 @@ List built-in strategy presets:
 ```powershell
 python.exe .\portfolio_growth_plan.py --list-presets
 ```
+
+## Shared Config and Math
+
+`config.yaml` is the single source of truth for shared assumptions: portfolio
+equity base and target NAV, the goal window, the risk-free rate used by
+Black-Scholes fallbacks, and reported buying power. Scripts read it via
+`portfolio_core.load_config()` / `config_value()`; CLI flags still override it
+where supported. Edit the numbers in one place and every report follows.
+
+`option_math.py` is the single canonical Black-Scholes implementation (price,
+delta, gamma, vega, theta, bisection IV, plus vectorized variants). It was
+consolidated from eleven per-script copies that had drifted apart; the
+migration was verified numerically identical on randomized inputs. All listed
+equity options are American, so every Black-Scholes output here is an
+estimate, not a mark.
+
+## Script Index
+
+| Script | Purpose |
+|---|---|
+| `final_portfolio_noise_checker_v2.py` | Primary: mark-noise / sanity checker for option day P&L (call spreads, short puts, put spreads) |
+| `portfolio_dashboard.py` | One-screen NAV, goal progress, Greeks, expiry ladder, margin snapshot |
+| `portfolio_risk_report.py` | Live valuation + portfolio Greeks/exposure report |
+| `portfolio_day_change.py` | Day-change attribution for the holdings CSV |
+| `after_hours_portfolio_pnl.py` | After-hours / overnight P&L estimate (perps, ETF proxies, IV-hold repricing) |
+| `csp_calc.py` | Cash-secured put reserve needs and put-spread max-profit views |
+| `portfolio_growth_plan.py` | Goal path planner with strategy sleeves and presets |
+| `deployment_plan.py` | Concrete deployment plan: closes, CSP/CC strikes, timeline |
+| `portfolio_gamma_vega.py` | Portfolio gamma/vega exposure |
+| `portfolio_pnl_decomposition.py` | Day-change decomposition into delta/gamma/vega/theta/residual |
+| `iv_crush_impact.py` | Sensitivity of the book to IV-crush scenarios |
+| `roll_postmortem.py` | Realized call-spread P&L per underlying from a transactions CSV (complements snapshot unrealized P&L) |
+| `nasdaq100_quant_model.py` | Nasdaq-100 scanner, backtest, regime filter |
+| `market_indicator_snapshot.py` | Market regime / indicator snapshot |
+| `frankfurt_portfolio_pnl.py`, `frankfurt_portfolio_quotes.py`, `frankfurt_vs_nasdaq_compare.py` | Frankfurt-listed holdings P&L and Nasdaq comparison |
+| `compound_interest_calc.py` | Standalone compounding calculator |
+| `portfolio_margin_requirement.py` | Portfolio margin requirement estimator |
+| `portfolio_core.py` | Shared Schwab CSV parsing, normalization, config loading |
+| `option_math.py` | Shared Black-Scholes math |
+| `legacy/` | Superseded one-offs (`day_change_call_spreads`, `short_put_delta_check`, `bull_call_spread_value`, `call_spread_review`) — kept for reference only |
 
 ## What This Tool Is
 

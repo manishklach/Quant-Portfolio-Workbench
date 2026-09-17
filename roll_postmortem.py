@@ -1,29 +1,36 @@
-import csv
-import re
-from collections import defaultdict
+"""Summarize realized call-spread P&L per underlying from a Schwab transactions CSV.
 
-CSV_PATH = r"C:\Users\ManishKL\Downloads\Main_Brokerage_XXX266_Transactions_20260530-132245.csv"
+Note: holdings snapshots only show unrealized P&L on remaining legs. This
+script reads the transactions export so rolls, closes, and assignments are
+included — it is the realized-P&L complement to the snapshot tools.
+"""
+
+import argparse
+import csv
+from collections import defaultdict
+from pathlib import Path
+
+from portfolio_core import clean_numeric, parse_option_symbol
+
+DEFAULT_CSV_PATH = r"C:\Users\ManishKL\Downloads\Main_Brokerage_XXX266_Transactions_20260530-132245.csv"
+
 
 def parse_amount(s):
-    if not s or s.strip() == "":
-        return 0.0
-    return float(s.replace("$", "").replace(",", ""))
+    return clean_numeric(s)
+
 
 def parse_qty(s):
-    if not s or s.strip() == "":
-        return 0
-    return int(float(s.replace(",", "")))
-
-def parse_option_symbol(symbol):
-    m = re.match(r"^([A-Z]+)\s+(\d{2}/\d{2}/\d{4})\s+([\d.]+)\s+(C|P)$", symbol)
-    if m:
-        return m.group(1), m.group(2), float(m.group(3)), m.group(4)
-    return None
+    return int(clean_numeric(s))
 
 def main():
+    parser = argparse.ArgumentParser(description="Summarize realized call-spread P&L from a Schwab transactions CSV.")
+    parser.add_argument("--csv", default=None, help="Transactions CSV path (default: hardcoded download path)")
+    args = parser.parse_args()
+    csv_path = Path(args.csv) if args.csv else Path(DEFAULT_CSV_PATH)
+
     option_trades = []
     seen = set()
-    with open(CSV_PATH, "r") as f:
+    with open(csv_path, "r") as f:
         reader = csv.reader(f)
         next(reader)
         for row in reader:

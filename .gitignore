@@ -8,3 +8,6 @@ __pycache__/
 
 # Keep code and docs shareable
 !README.md
+
+# Runtime state (regenerated on each dashboard run)
+dashboard_state.json

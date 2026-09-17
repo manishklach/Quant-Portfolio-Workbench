@@ -1,25 +1,21 @@
 """Estimate naked short put reserve needs and defined-risk put spread exposure."""
 
 import argparse
-import math
 from datetime import datetime, timezone
 
 import pandas as pd
 from openpyxl import load_workbook
 
-from portfolio_core import active_option_positions, clean_numeric, default_csv_path, load_schwab_holdings
+from portfolio_core import active_option_positions, clean_numeric, config_value, default_csv_path, load_schwab_holdings
+from option_math import bs_put_delta
 
 try:
     import yfinance as yf
 except ImportError:
     yf = None
 
-rISK_FREE_RATE = 0.045
-DIVIDEND_YIELD = 0.0
-
-
-def norm_cdf(x):
-    return 0.5 * (1.0 + math.erf(x / math.sqrt(2)))
+RISK_FREE_RATE = float(config_value("market.risk_free_rate", 0.045))
+DIVIDEND_YIELD = float(config_value("market.dividend_yield", 0.0))
 
 
 def year_frac(expiration):
@@ -29,18 +25,6 @@ def year_frac(expiration):
         return max((exp_dt - now).total_seconds() / 86400.0 / 365.0, 1 / 365)
     except Exception:
         return float("nan")
-
-
-def bs_put_delta(spot, strike, time_to_expiry, rate, sigma, dividend_yield=0.0):
-    if any(pd.isna(value) for value in [spot, strike, time_to_expiry, rate, sigma, dividend_yield]):
-        return float("nan")
-    if spot <= 0 or strike <= 0 or time_to_expiry <= 0 or sigma <= 0:
-        return float("nan")
-    d1 = (
-        math.log(spot / strike)
-        + (rate - dividend_yield + 0.5 * sigma * sigma) * time_to_expiry
-    ) / (sigma * math.sqrt(time_to_expiry))
-    return -math.exp(-dividend_yield * time_to_expiry) * norm_cdf(-d1)
 
 
 def nearest_expiration(ticker_obj, target_expiration):
@@ -80,7 +64,7 @@ def compute_put_delta(ticker, expiration, strike, stock_price, broker_delta):
         return broker_delta
     iv = fetch_yf_iv_for_put(ticker, expiration, strike)
     time_to_expiry = year_frac(expiration)
-    return bs_put_delta(stock_price, strike, time_to_expiry, rISK_FREE_RATE, iv, DIVIDEND_YIELD)
+    return bs_put_delta(stock_price, strike, time_to_expiry, RISK_FREE_RATE, iv, DIVIDEND_YIELD)
 
 
 def fetch_current_stock_prices(tickers):

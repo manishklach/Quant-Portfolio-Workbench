@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import math
 from datetime import datetime, date
 from pathlib import Path
 
@@ -14,55 +13,27 @@ import yfinance as yf
 
 from portfolio_core import (
     active_option_positions,
+    config_value,
     default_csv_path,
     load_schwab_holdings,
+)
+from option_math import (
+    bs_delta_vec,
+    bs_theta_vec,
+    implied_volatility,
 )
 
 SECTION_WIDTH = 90
 
 STATE_FILE = Path(__file__).with_name("dashboard_state.json")
-TARGET_NAV = 25_000_000.0
-EQUITY = 20_000_000.0
-MARGIN_AVAILABLE = 27_000_000.0
-START_DATE = date(2026, 7, 8)
-END_DATE = date(2026, 12, 31)
-
-
-def norm_cdf(x):
-    return 0.5 * (1.0 + np.vectorize(math.erf)(np.asarray(x, dtype=float) / math.sqrt(2.0)))
-
-
-def bs_d1(spot, strike, t, r, sigma):
-    spot = np.maximum(np.asarray(spot, dtype=float), 1e-9)
-    strike = np.maximum(np.asarray(strike, dtype=float), 1e-9)
-    t = np.maximum(np.asarray(t, dtype=float), 1e-9)
-    sigma = np.maximum(np.asarray(sigma, dtype=float), 1e-6)
-    return (np.log(spot / strike) + (r + 0.5 * sigma**2) * t) / (sigma * np.sqrt(t))
-
-
-def bs_theta_vec(spot, strike, t, r, sigma, opt_type):
-    d1 = bs_d1(spot, strike, t, r, sigma)
-    d2 = d1 - np.maximum(np.asarray(sigma, dtype=float), 1e-6) * np.sqrt(np.maximum(np.asarray(t, dtype=float), 1e-9))
-    pdf_d1 = (1.0 / math.sqrt(2.0 * math.pi)) * np.exp(-0.5 * d1**2)
-    carry = r * np.asarray(strike, dtype=float) * np.exp(-r * np.maximum(np.asarray(t, dtype=float), 1e-9))
-    call_theta = (
-        -np.asarray(spot, dtype=float) * pdf_d1 * np.asarray(sigma, dtype=float)
-        / (2.0 * np.sqrt(np.maximum(np.asarray(t, dtype=float), 1e-9)))
-        - carry * norm_cdf(d2)
-    )
-    put_theta = (
-        -np.asarray(spot, dtype=float) * pdf_d1 * np.asarray(sigma, dtype=float)
-        / (2.0 * np.sqrt(np.maximum(np.asarray(t, dtype=float), 1e-9)))
-        + carry * norm_cdf(-d2)
-    )
-    return np.where(np.asarray(opt_type) == "C", call_theta, put_theta)
-
-
-def bs_delta_vec(spot, strike, t, r, sigma, opt_type):
-    d1 = bs_d1(spot, strike, t, r, sigma)
-    call_delta = norm_cdf(d1)
-    put_delta = call_delta - 1.0
-    return np.where(np.asarray(opt_type) == "C", call_delta, put_delta)
+TARGET_NAV = float(config_value("portfolio.target_nav", 24_000_000.0))
+EQUITY = float(config_value("portfolio.equity_base", 16_000_000.0))
+# NOTE: buying power here is the account's actual reported buying power, not a
+# 2x Reg-T figure. The "margin used" line below assumes 2x Reg-T capacity and
+# is a rough estimate only.
+MARGIN_AVAILABLE = float(config_value("account.buying_power", 16_500_000.0))
+START_DATE = date.fromisoformat(str(config_value("portfolio.goal_start_date", "2026-09-13")))
+END_DATE = date.fromisoformat(str(config_value("portfolio.goal_end_date", "2027-09-13")))
 
 
 def fmt(v: float) -> str:
@@ -116,8 +87,20 @@ def compute_option_greeks(options: pd.DataFrame, risk_free_rate: float) -> pd.Da
         opts["Strike Price"].fillna(opts["Price Numeric"] * 100.0)
     )
     opts["T"] = np.maximum(opts["Days To Expiry"].fillna(1).astype(float), 1.0) / 365.0
-    price_ratio = opts["Price Numeric"].astype(float) / np.maximum(opts["Spot"].astype(float), 1.0)
-    opts["IV"] = np.clip(np.where(opts["Price Numeric"] > 0, price_ratio * 4.0, 0.55), 0.10, 2.0)
+    # Infer IV from the broker mark via bisection; fall back to the old
+    # price-ratio heuristic only when the mark can't be bracketed.
+    def _infer_iv(row):
+        iv = implied_volatility(
+            row["Price Numeric"], row["Spot"], row["Strike Price"], row["T"],
+            risk_free_rate, row["Opt Type"],
+        )
+        if iv is not None:
+            return float(np.clip(iv, 0.10, 2.0))
+        price = float(row["Price Numeric"])
+        ratio = price / max(float(row["Spot"]), 1.0)
+        return float(np.clip(ratio * 4.0 if price > 0 else 0.55, 0.10, 2.0))
+
+    opts["IV"] = opts.apply(_infer_iv, axis=1)
 
     spot = opts["Spot"].to_numpy(dtype=float)
     strike = opts["Strike Price"].to_numpy(dtype=float)
@@ -214,14 +197,14 @@ def main():
     print("=" * SECTION_WIDTH)
 
     print_section("NAV & GOAL PROGRESS")
-    print(f"  Market Value:              {fmt(nav):>14s}  (={fmt_signed(nav - EQUITY):>14s} from $20M base)")
+    print(f"  Market Value:              {fmt(nav):>14s}  (={fmt_signed(nav - EQUITY):>14s} from ${EQUITY/1e6:.0f}M base)")
     print(f"  Equity Base:               {fmt(EQUITY):>14s}")
-    print(f"  Target (Dec 31, 2026):     {fmt(TARGET_NAV):>14s}")
+    print(f"  Target ({END_DATE}):     {fmt(TARGET_NAV):>14s}")
     print(f"  Gap to Target:             {fmt(required_total):>14s}")
-    print(f"  Days Remaining:            {days_remaining:>14d}  ({pct_time_elapsed:.0f}% of H2 elapsed)")
+    print(f"  Days Remaining:            {days_remaining:>14d}  ({pct_time_elapsed:.0f}% of goal period elapsed)")
     print(f"  Required Daily Gain:       {fmt(daily_required):>14s}")
     print()
-    print("  Progress:  $20M -> $25M")
+    print(f"  Progress:  ${EQUITY/1e6:.0f}M -> ${TARGET_NAV/1e6:.0f}M")
     print_progress_bar(progress_toward_goal, gap)
     print(f"  {fmt(progress_toward_goal):>12s} / {fmt(gap)}")
 
@@ -287,7 +270,7 @@ def main():
     print(f"  Target CSP notional: $5-8M  ->  target theta: $8-10K/day")
 
     print_section("NEXT ACTIONS")
-    print("  1. Run `python call_spread_review.py` to review verticals")
+    print("  1. Run `python final_portfolio_noise_checker_v2.py` to review verticals")
     print("  2. Run `python portfolio_growth_plan.py` for a structured plan")
     print("  3. Deploy CSP ladder once spread review is complete")
     print("  4. Consider adding to QQQI/XQQI on pullbacks")

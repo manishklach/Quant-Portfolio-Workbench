@@ -14,7 +14,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import math
 import re
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -34,11 +33,12 @@ try:
 except ImportError:
     yf = None
 
-from portfolio_core import clean_numeric, default_csv_path, load_schwab_holdings
+from portfolio_core import clean_numeric, config_value, default_csv_path, load_schwab_holdings
+from option_math import bs_price, implied_volatility
 
 
-RISK_FREE_RATE = 0.045
-DIVIDEND_YIELD = 0.0
+RISK_FREE_RATE = float(config_value("market.risk_free_rate", 0.045))
+DIVIDEND_YIELD = float(config_value("market.dividend_yield", 0.0))
 UTC = timezone.utc
 EASTERN_OFFSET = timezone(timedelta(hours=-4))
 COINBASE_PRODUCTS_URL = "https://api.coinbase.com/api/v3/brokerage/market/products"
@@ -97,53 +97,6 @@ def current_extended_session_bucket(now_dt: datetime | None = None) -> str | Non
     if REGULAR_CLOSE <= local_time < POST_MARKET_CLOSE:
         return "post_market"
     return None
-
-
-def norm_cdf(x: float) -> float:
-    return 0.5 * (1.0 + math.erf(x / math.sqrt(2.0)))
-
-
-def bs_price(spot: float, strike: float, time_to_expiry: float, rate: float, sigma: float, option_type: str, dividend_yield: float = 0.0) -> float:
-    if min(spot, strike, time_to_expiry, sigma) <= 0:
-        intrinsic = max(spot - strike, 0.0) if option_type == "C" else max(strike - spot, 0.0)
-        return intrinsic
-
-    sqrt_t = math.sqrt(time_to_expiry)
-    d1 = (
-        math.log(spot / strike)
-        + (rate - dividend_yield + 0.5 * sigma * sigma) * time_to_expiry
-    ) / (sigma * sqrt_t)
-    d2 = d1 - sigma * sqrt_t
-    discounted_spot = spot * math.exp(-dividend_yield * time_to_expiry)
-    discounted_strike = strike * math.exp(-rate * time_to_expiry)
-
-    if option_type == "C":
-        return discounted_spot * norm_cdf(d1) - discounted_strike * norm_cdf(d2)
-    return discounted_strike * norm_cdf(-d2) - discounted_spot * norm_cdf(-d1)
-
-
-def implied_volatility(target_price: float, spot: float, strike: float, time_to_expiry: float, option_type: str) -> float | None:
-    if min(target_price, spot, strike, time_to_expiry) <= 0:
-        return None
-
-    low = 1e-4
-    high = 5.0
-    low_price = bs_price(spot, strike, time_to_expiry, RISK_FREE_RATE, low, option_type, DIVIDEND_YIELD)
-    high_price = bs_price(spot, strike, time_to_expiry, RISK_FREE_RATE, high, option_type, DIVIDEND_YIELD)
-
-    if target_price < low_price - 1e-6 or target_price > high_price + 1e-6:
-        return None
-
-    for _ in range(80):
-        mid = (low + high) / 2.0
-        mid_price = bs_price(spot, strike, time_to_expiry, RISK_FREE_RATE, mid, option_type, DIVIDEND_YIELD)
-        if abs(mid_price - target_price) < 1e-5:
-            return mid
-        if mid_price < target_price:
-            low = mid
-        else:
-            high = mid
-    return (low + high) / 2.0
 
 
 def year_fraction_to_expiry(expiration_text: str) -> float:
@@ -891,7 +844,10 @@ def estimate_option_after_hours_price(row: pd.Series, underlying_regular: float,
     if option_mark <= 0 or pd.isna(time_to_expiry):
         return option_mark, "mark"
 
-    iv = implied_volatility(option_mark, underlying_regular, strike, time_to_expiry, option_type)
+    iv = implied_volatility(
+        option_mark, underlying_regular, strike, time_to_expiry,
+        RISK_FREE_RATE, option_type, DIVIDEND_YIELD,
+    )
     if iv is not None:
         return bs_price(underlying_post, strike, time_to_expiry, RISK_FREE_RATE, iv, option_type, DIVIDEND_YIELD), "bs_iv_hold"
 
