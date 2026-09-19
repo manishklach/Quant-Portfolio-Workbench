@@ -20,6 +20,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from io import StringIO
 from datetime import datetime, time, timedelta, timezone
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 import pandas as pd
 
@@ -940,19 +941,15 @@ def build_after_hours_report(
             leveraged_proxy = leveraged_proxy_cache.get(ticker, {})
             if leveraged_proxy:
                 proxy_return = float(leveraged_proxy["leveraged_return"])
-                direct_return = None
-                if after_hours_price is not None and regular_price not in (None, 0):
-                    direct_return = (after_hours_price - regular_price) / regular_price
 
                 proxy_meta = LEVERAGED_PROXY_MAP.get(ticker, {})
                 max_gap = proxy_meta.get("max_direct_ah_proxy_gap")
                 use_proxy = prefer_perp or after_hours_price is None
-                if (
-                    not use_proxy
-                    and direct_return is not None
-                    and max_gap is not None
-                    and abs(float(direct_return) - proxy_return) > float(max_gap)
-                ):
+                if max_gap is not None:
+                    # QQQI/XQQI are QQQ covered-call income ETFs whose own AH
+                    # prints are thin/stale and can even print the wrong sign
+                    # vs QQQ. The QQQ proxy is authoritative: always prefer it
+                    # when available.
                     use_proxy = True
 
                 if use_proxy:
@@ -1099,6 +1096,45 @@ def fetch_index_futures_snapshot() -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
+def fetch_completed_exchange_close(ticker: str) -> tuple[float | None, str | None]:
+    """Use unadjusted daily bars, never an in-progress regular-session bar."""
+    try:
+        instrument = yf.Ticker(ticker)
+        history = instrument.history(period="1mo", interval="1d", auto_adjust=False)
+        now = datetime.now(ZoneInfo("America/New_York"))
+        # Yahoo's session end handles early closes; absent metadata, omit today.
+        metadata = instrument.get_history_metadata() or {}
+        end = (metadata.get("currentTradingPeriod", {}).get("regular", {}) or {}).get("end")
+        session_end = datetime.fromtimestamp(float(end), UTC).astimezone(now.tzinfo) if end else None
+        today_complete = session_end is not None and session_end.date() == now.date() and now >= session_end
+        dates = history.index.date
+        history = history[(dates < now.date()) | ((dates == now.date()) & today_complete)]
+        closes = history["Close"].dropna()
+        closes = closes[(closes > 0) & closes.map(math.isfinite)]
+        if not closes.empty:
+            return float(closes.iloc[-1]), closes.index[-1].date().isoformat()
+    except Exception:
+        pass
+    return None, None
+
+
+def add_perp_close_changes(out: pd.DataFrame) -> pd.DataFrame:
+    out = out.copy()
+    out["price_ticker"] = out.apply(
+        lambda row: row["perp_symbol"] if row["perp_source"] == "proxy" else row["ticker"], axis=1
+    )
+    tickers = out["price_ticker"].unique()
+    with ThreadPoolExecutor(max_workers=8) as executor:
+        closes = dict(zip(tickers, executor.map(fetch_completed_exchange_close, tickers)))
+    out["exchange_close"] = out["price_ticker"].map(lambda ticker: closes[ticker][0])
+    out["close_date"] = out["price_ticker"].map(lambda ticker: closes[ticker][1])
+    prices = pd.to_numeric(out["perp_price_used"], errors="coerce")
+    valid = prices.map(lambda value: pd.notna(value) and math.isfinite(value) and value > 0)
+    out["change_usd"] = prices.where(valid) - pd.to_numeric(out["exchange_close"], errors="coerce")
+    out["change_pct"] = 100.0 * out["change_usd"] / pd.to_numeric(out["exchange_close"], errors="coerce")
+    return out
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Estimate after-hours / overnight portfolio P/L from my_holdings.csv")
     parser.add_argument("csv", nargs="?", help="Optional positional path to holdings CSV")
@@ -1216,7 +1252,10 @@ def main() -> int:
         if out.empty:
             print("No held tickers currently match the supported perp-based pricing sources.")
         else:
-            print(out.sort_values("ticker").to_string(index=False))
+            out = add_perp_close_changes(out)
+            print("Changes versus the last completed regular exchange close (USD).")
+            print("Proxy rows compare the price_ticker, not the held ETF's own price. Missing comparisons show N/A.")
+            print(out.sort_values("ticker").to_string(index=False, na_rep="N/A", float_format=lambda value: f"{value:,.2f}"))
         return 0
 
     positions, by_ticker = build_after_hours_report(
