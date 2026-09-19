@@ -249,6 +249,7 @@ Perpetual-futures support:
 
 - `--list-perps` prints which held tickers currently have supported perp-based pricing sources
 - `--prefer-perp` makes the script prefer the supported perpetual price even if Yahoo post-market data exists
+- `--list-perps` also compares each source price against the last completed regular-session close (`change_usd` / `change_pct`, from unadjusted daily bars — never an in-progress bar). Proxy rows compare the proxy ticker (for example `QQQ` for `XQQI`), not the held ETF's own price, so a missing comparison shows as `N/A`.
 
 Current supported held names are determined live from Coinbase's public equity perpetual feed and Hyperliquid direct perp overrides and, when last checked, included names such as:
 
@@ -277,14 +278,21 @@ This keeps the overnight proxy closer to the underlying reference than to a nois
 
 ### QQQ-Based ETF Proxies
 
-When you use `--prefer-perp`, certain income or proxy ETFs can inherit `QQQ`'s overnight move when they do not have a better direct after-hours signal.
+`QQQI` and `XQQI` are covered-call income ETFs whose own after-hours prints are
+thin and can go stale — including printing down on a session where `QQQ` is up.
+Their `QQQ` proxy is therefore authoritative: whenever a `QQQ`
+extended-hours move is available, both tickers inherit the approximate `1.0x`
+`QQQ` move instead of using their own direct quote. This applies in every mode
+(default, `--prefer-perp`, `--overnight`); no flag is needed.
 
 Current `QQQ`-linked proxy coverage includes:
 
-- `QQQI`
-- `XQQI`
+- `QQQI` → `1.0x QQQ`
+- `XQQI` → `1.0x QQQ`
 
-These are treated as approximate `1.0x` `QQQ` move proxies for overnight estimation, so they are useful for a fast portfolio read but should not be treated as an official NAV calculation.
+(`MUU`, the `2x MU` ETF, still prefers its own direct quote when available.)
+These proxies are useful for a fast portfolio read but should not be treated as
+an official NAV calculation.
 
 ### DRAM ETF Proxy
 
@@ -697,6 +705,11 @@ Correct spreads should look like:
 Debugging note:
 
 - if the output shows decimal strike spreads that look like option prices, the parser is wrong or the wrong script version is being run
+
+The column resolver additionally guards its substring fallback so a `Price`
+lookup can never resolve to `Strike Price` (or vice versa) when the exact
+column is absent from an export — the same Price-vs-strike confusion, one layer
+deeper.
 
 ### Calendars and Diagonals Are Intentionally Excluded
 
