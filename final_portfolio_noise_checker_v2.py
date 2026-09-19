@@ -104,6 +104,11 @@ def find_col_exact_or_contains(df, candidates, required=True):
         key = normalize_col(cand)
         for k, original in norm_map.items():
             if key and key in k:
+                # Never cross-match strike and non-strike columns in the
+                # substring fallback (e.g. "Price" must not resolve to
+                # "Strike Price" when no plain Price column exists).
+                if ("strike" in k) != ("strike" in key):
+                    continue
                 return original
     if required:
         raise ValueError(f"Could not find required column. Tried {candidates}\nAvailable: {list(df.columns)}")
