@@ -43,7 +43,6 @@ RISK_FREE_RATE = float(config_value("market.risk_free_rate", 0.045))
 DIVIDEND_YIELD = float(config_value("market.dividend_yield", 0.0))
 UTC = timezone.utc
 EASTERN_OFFSET = timezone(timedelta(hours=-4))
-COINBASE_PRODUCTS_URL = "https://api.coinbase.com/api/v3/brokerage/market/products"
 HYPERLIQUID_INFO_URL = "https://api.hyperliquid.xyz/info"
 DRAM_HOLDINGS_URL = "https://stockanalysis.com/etf/dram/holdings/"
 ROBINHOOD_QUOTE_URLS = (
@@ -582,7 +581,7 @@ def fetch_hyperliquid_perp_snapshots(dex: str = "") -> dict[str, dict[str, float
     try:
         response = requests.post(
             HYPERLIQUID_INFO_URL,
-            json={"type": "allMids", "dex": dex},
+            json={"type": "metaAndAssetCtxs", "dex": dex},
             headers={"Content-Type": "application/json"},
             timeout=20,
         )
@@ -592,12 +591,19 @@ def fetch_hyperliquid_perp_snapshots(dex: str = "") -> dict[str, dict[str, float
         return {}
 
     out: dict[str, dict[str, float | str | None]] = {}
-    for symbol, mid in payload.items():
+    metadata, contexts = payload
+    for asset, context in zip(metadata.get("universe", []), contexts):
+        if asset.get("isDelisted"):
+            continue
+        symbol = asset.get("name")
+        mid = context.get("midPx")
         symbol = str(symbol or "").strip().upper()
         if not symbol:
             continue
 
         mid_price = pd.to_numeric(mid, errors="coerce")
+        if pd.isna(mid_price) or not math.isfinite(float(mid_price)) or mid_price <= 0:
+            continue
         synthetic_price = mid_price
         price_source = "hyperliquid_mid"
 
@@ -787,54 +793,17 @@ def build_leveraged_proxy_snapshot(
     }
 
 
-def fetch_coinbase_equity_perp_snapshots() -> dict[str, dict[str, float | str | None]]:
-    if requests is None:
-        return {}
-
-    params = {
-        "product_type": "FUTURE",
-        "contract_expiry_type": "PERPETUAL",
-        "futures_underlying_type": "FUTURES_UNDERLYING_TYPE_EQUITY",
-        "limit": 500,
-    }
-    try:
-        response = requests.get(COINBASE_PRODUCTS_URL, params=params, timeout=20)
-        response.raise_for_status()
-        products = response.json().get("products", [])
-    except Exception:
-        return {}
-
-    out: dict[str, dict[str, float | str | None]] = {}
-    for product in products:
-        details = product.get("future_product_details") or {}
-        ticker = (details.get("contract_code") or "").strip().upper()
-        if not ticker:
-            continue
-
-        index_price = pd.to_numeric(details.get("index_price"), errors="coerce")
-        last_price = pd.to_numeric(product.get("price"), errors="coerce")
-        mid_price = pd.to_numeric(product.get("mid_market_price"), errors="coerce")
-
-        synthetic_price = index_price
-        price_source = "coinbase_perp_index"
-        if pd.isna(synthetic_price):
-            synthetic_price = last_price
-            price_source = "coinbase_perp_last"
-        if pd.isna(synthetic_price):
-            synthetic_price = mid_price
-            price_source = "coinbase_perp_mid"
-
-        out[ticker] = {
-            "ticker": ticker,
-            "product_id": product.get("product_id"),
-            "display_name": product.get("display_name"),
-            "synthetic_price": float(synthetic_price) if not pd.isna(synthetic_price) else None,
-            "index_price": float(index_price) if not pd.isna(index_price) else None,
-            "last_price": float(last_price) if not pd.isna(last_price) else None,
-            "mid_price": float(mid_price) if not pd.isna(mid_price) else None,
-            "price_source": price_source if not pd.isna(synthetic_price) else None,
+def fetch_equity_perp_snapshots() -> dict[str, dict[str, float | str | None]]:
+    """Use active XYZ equity markets; never substitute Coinbase index prices."""
+    snapshots = fetch_hyperliquid_perp_snapshots(dex="xyz")
+    return {
+        symbol.split(":", 1)[-1]: {
+            **quote,
+            "product_id": symbol,
+            "ticker": symbol.split(":", 1)[-1],
         }
-    return out
+        for symbol, quote in snapshots.items()
+    }
 
 
 def estimate_option_after_hours_price(row: pd.Series, underlying_regular: float, underlying_post: float) -> tuple[float, str]:
@@ -887,7 +856,7 @@ def build_after_hours_report(
         set_batch_quotes(batch_quotes)
 
     quote_cache: dict[str, dict[str, float | str | None]] = {}
-    perp_cache = fetch_coinbase_equity_perp_snapshots()
+    perp_cache = fetch_equity_perp_snapshots()
     direct_perp_cache: dict[str, dict[str, float | str | None]] = {}
     for config in DIRECT_PERP_CONFIG.values():
         if str(config.get("source") or "").strip().lower() == "hyperliquid":
@@ -1001,7 +970,7 @@ def build_after_hours_report(
                 "after_hours_source": after_hours_source,
                 "extended_hours_session": (
                     "perp"
-                    if isinstance(after_hours_source, str) and after_hours_source.startswith("coinbase_perp")
+                    if isinstance(after_hours_source, str) and after_hours_source.startswith("hyperliquid")
                     else quote.get("overnight_session")
                     if after_hours_source == "yahoo_pre"
                     else quote.get("premarket_session")
@@ -1142,7 +1111,7 @@ def main() -> int:
     parser.add_argument("--file", default=None, help="Path to holdings CSV (default: my_holdings.csv next to script)")
     parser.add_argument("--output", default=None, help="Optional CSV path for position-level output")
     parser.add_argument("--list-perps", action="store_true", help="Print held tickers that have supported perp-based pricing sources")
-    parser.add_argument("--prefer-perp", action="store_true", help="Prefer Coinbase equity perpetual prices over Yahoo post/pre-market when available")
+    parser.add_argument("--prefer-perp", action="store_true", help="Prefer active Hyperliquid equity perpetual midpoints over Yahoo post/pre-market when available")
     parser.add_argument("--prefer-etf-proxy", action="store_true", help="Prefer ETF basket proxy pricing for supported ETFs like DRAM")
     parser.add_argument("--overnight", action="store_true", help="Use overnight/pre-market quotes only from Yahoo when available; separate from the default post-market path.")
     parser.add_argument("--robinhood", action="store_true", help="Enable Robinhood 24h quote scraping (slow, off by default)")
@@ -1152,7 +1121,7 @@ def main() -> int:
     if args.list_perps:
         holdings = load_schwab_holdings(csv_path)
         held = sorted(set(holdings["Underlying"].dropna().astype(str).str.upper()))
-        coinbase_perps = fetch_coinbase_equity_perp_snapshots()
+        equity_perps = fetch_equity_perp_snapshots()
         hyperliquid_caches: dict[str, dict[str, dict[str, float | str | None]]] = {}
         quote_cache: dict[str, dict[str, float | str | None]] = {}
         proxy_underlyings = {
@@ -1162,12 +1131,12 @@ def main() -> int:
         }
         rows = []
         for ticker in held:
-            perp = coinbase_perps.get(ticker)
+            perp = equity_perps.get(ticker)
             if perp:
                 rows.append(
                     {
                         "ticker": ticker,
-                        "perp_source": "coinbase",
+                        "perp_source": "hyperliquid",
                         "perp_symbol": perp.get("product_id"),
                         "price_source": perp.get("price_source"),
                         "perp_price_used": perp.get("synthetic_price"),
@@ -1206,7 +1175,7 @@ def main() -> int:
                 anchor_after_hours_price, anchor_price_source = choose_after_hours_price(
                     ticker,
                     anchor_quote,
-                    coinbase_perps.get(ticker, {}),
+                    equity_perps.get(ticker, {}),
                     prefer_perp=True,
                 )
                 if anchor_after_hours_price is not None:
@@ -1232,7 +1201,7 @@ def main() -> int:
                             quote_cache[underlying] = {"regular": None, "previous_close": None, "post": None, "post_source": None, "extended_hours_session": None, "exchange": None}
 
                     underlying_quote = quote_cache.get(underlying, {})
-                    underlying_perp = coinbase_perps.get(underlying, {})
+                    underlying_perp = equity_perps.get(underlying, {})
                     proxy_after_hours_price, proxy_price_source = choose_after_hours_price(
                         underlying,
                         underlying_quote,
