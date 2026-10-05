@@ -894,3 +894,19 @@ Before sharing the repo or code:
 1. Remove `my_holdings.csv`.
 2. Remove generated `.csv`, `.xls`, and `.xlsx` files.
 3. Share only code and docs, not account data.
+# Option Payoff Ceiling Report
+
+Run `python .\portfolio_max_gain.py` for all current options, or
+`python .\portfolio_max_gain.py .\my_holdings.csv --ticker TQQQ` for one underlying.
+Use `--as-of YYYY-MM-DD` when analyzing a historical export.
+
+The report evaluates expiry payoffs at zero and every strike, combining signed
+contract quantities without reusing legs. It shows call/put books separately,
+then combines them per ticker and expiration before calculating totals. Columns
+distinguish gross payoff, profit versus open-leg cost basis, and additional gain
+from current marks. Net long-call exposure has an unbounded upside ceiling.
+Finite totals exclude unbounded expiration books (including any spreads inside
+those books); they are not the earlier matched-vertical-only subtotal. Different
+expirations optimize independently: calendars/diagonals need a price path and
+exercise/closing assumptions. Realized roll results, fees, taxes and nonstandard
+contract multipliers are not modeled. No live prices are required.
