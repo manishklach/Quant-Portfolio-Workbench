@@ -898,6 +898,18 @@ Before sharing the repo or code:
 
 Run `python .\portfolio_max_gain.py` for all current options, or
 `python .\portfolio_max_gain.py .\my_holdings.csv --ticker TQQQ` for one underlying.
+
+Use `--calls` for calls/call spreads only or `--puts` for puts (including CSPs
+and put spreads) only. These filters apply to every table and total and can be
+combined with `--ticker`, for example:
+
+```powershell
+python .\portfolio_max_gain.py --calls
+python .\portfolio_max_gain.py --puts
+python .\portfolio_max_gain.py --puts --ticker TQQQ
+```
+
+The two filters are mutually exclusive. Omit both to include all options.
 Use `--as-of YYYY-MM-DD` when analyzing a historical export.
 
 The report evaluates expiry payoffs at zero and every strike, combining signed

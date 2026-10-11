@@ -67,6 +67,9 @@ def main(argv=None):
     parser.add_argument('csv', nargs='?', default=None,
                         help='Holdings CSV; defaults to my_holdings.csv beside this script')
     parser.add_argument('--ticker', help='Filter underlying, e.g. TQQQ')
+    types = parser.add_mutually_exclusive_group()
+    types.add_argument('--calls', action='store_true', help='Only calls and call spreads')
+    types.add_argument('--puts', action='store_true', help='Only puts, including short puts and put spreads')
     parser.add_argument('--as-of', type=date.fromisoformat, default=date.today(),
                         help='Expiry cutoff YYYY-MM-DD')
     from pathlib import Path
@@ -75,14 +78,17 @@ def main(argv=None):
     options = active_option_positions(load_schwab_holdings(path, as_of=args.as_of))
     if args.ticker:
         options = options[options['Underlying'].str.upper() == args.ticker.strip().upper()]
+    if args.calls or args.puts:
+        options = options[options['Opt Type'] == ('C' if args.calls else 'P')]
     if options.empty:
         print('No matching active options.')
         return
     print(f'Source: {path.resolve()}')
+    print('Option filter:', 'CALLS ONLY' if args.calls else 'PUTS ONLY' if args.puts else 'ALL OPTIONS')
     print('Standard 100-share contracts assumed. No live quotes fetched.\n')
-    print('CALL AND PUT BOOKS BY EXPIRATION (do not add separate maxima together)')
+    print('OPTION BOOKS BY EXPIRATION (do not add separate maxima together)')
     print_table(summarize(options, separate_types=True))
-    print('\nCOMBINED CALLS + PUTS AT EACH EXPIRATION')
+    print('\nSELECTED OPTIONS AT EACH EXPIRATION')
     combined = summarize(options)
     print_table(combined)
     finite = combined[combined['Max payoff'].map(math.isfinite)]
