@@ -310,7 +310,6 @@ def audit_option_day_pl_baselines(options, min_excess=10000.0, timeout=15.0):
     groups = {
         (ticker, option_type): group
         for (ticker, option_type), group in options.groupby(["ticker", "option_type"])
-        if float(group["day_pl"].sum()) < 0
     }
     tickers = sorted({ticker for ticker, _ in groups})
     chains = {}
@@ -338,13 +337,15 @@ def audit_option_day_pl_baselines(options, min_excess=10000.0, timeout=15.0):
             occ = cboe_occ_symbol(ticker, row["expiration"], row["strike"], row["option_type"])
             quote = option_map.get(occ)
             if not quote:
+                errors.append({"ticker": ticker, "cboe_error": f"Missing contract: {occ}"})
                 continue
 
             bid = num(quote.get("bid"))
             ask = num(quote.get("ask"))
             prior = num(quote.get("prev_day_close"))
             delta = num(quote.get("delta"))
-            if any(pd.isna(value) for value in [bid, ask, prior, delta, stock_change]):
+            if any(pd.isna(value) for value in [bid, ask, prior, delta, stock_change]) or bid < 0 or ask < bid:
+                errors.append({"ticker": ticker, "cboe_error": f"Invalid/incomplete quote: {occ}"})
                 continue
 
             quantity = float(row["quantity"])
@@ -365,6 +366,8 @@ def audit_option_day_pl_baselines(options, min_excess=10000.0, timeout=15.0):
                 "expiration": row["expiration"],
                 "contract": f"{float(row['strike']):g} {'C' if option_type == 'CALL' else 'P'}",
                 "quantity": quantity,
+                "strike": float(row["strike"]),
+                "cboe_theo": num(quote.get("theo")),
                 "schwab_mark": broker_mark,
                 "cboe_bid": bid,
                 "cboe_ask": ask,
@@ -411,6 +414,69 @@ def audit_option_day_pl_baselines(options, min_excess=10000.0, timeout=15.0):
     ]
     details = details.sort_values(["book_flagged", "midpoint_gap"], ascending=[False, False])
     return details, ticker_summary, pd.DataFrame(errors)
+
+
+def audit_current_call_marks(options, details, min_difference=1000.0):
+    """Signed valuation scenarios, separate from day-P/L baseline adjustments.
+
+    Greedy same-expiry vertical allocation consumes quantities once. It is not
+    a reconstruction of trade history; no diagnostic is added to model totals.
+    """
+    rows = []
+    lookup = {}
+    if not details.empty:
+        for _, row in details.iterrows():
+            lookup[(row["ticker"], str(row["expiration"]), row["contract"])] = row
+
+    def quote(row):
+        return lookup.get((row["ticker"], str(row["expiration"]), f"{float(row['strike']):g} C"), {})
+
+    for (ticker, expiration), group in options[options.option_type == "CALL"].groupby(["ticker", "expiration"]):
+        longs = group[group.quantity > 0].sort_values("strike").to_dict("records")
+        shorts = group[group.quantity < 0].sort_values("strike").to_dict("records")
+        for short in shorts:
+            remaining = -float(short["quantity"])
+            for long in longs:
+                if remaining <= 0:
+                    break
+                if long["quantity"] <= 0 or long["strike"] >= short["strike"]:
+                    continue
+                count = min(remaining, float(long["quantity"]))
+                remaining -= count
+                long["quantity"] -= count
+                mark = num(long.get("price")) - num(short.get("price"))
+                width = float(short["strike"] - long["strike"])
+                if not np.isfinite(mark):
+                    continue
+                lq, sq = quote(long), quote(short)
+                outside = any(
+                    np.isfinite(num(q.get("cboe_bid"))) and np.isfinite(num(q.get("cboe_ask")))
+                    and not (num(q.get("cboe_bid")) <= num(r.get("price")) <= num(q.get("cboe_ask")))
+                    for r, q in [(long, lq), (short, sq)]
+                )
+                theo = num(lq.get("cboe_theo")) - num(sq.get("cboe_theo"))
+                mid = num(lq.get("cboe_mid")) - num(sq.get("cboe_mid"))
+                invalid = mark < 0 or mark > width
+                estimate = np.nan
+                method = "bounds only"
+                if outside and np.isfinite(mid) and 0 <= mid <= width:
+                    estimate, method = mid, "Cboe midpoint (outside quote)"
+                elif np.isfinite(theo) and 0 <= theo <= width:
+                    estimate, method = theo, "Cboe theoretical (model only)"
+                difference = (estimate - mark) * count * 100
+                if not invalid and not outside and (not np.isfinite(difference) or abs(difference) < min_difference):
+                    continue
+                rows.append({
+                    "ticker": ticker, "expiration": expiration,
+                    "spread": f"{long['strike']:g}/{short['strike']:g} C",
+                    "contracts": count, "broker_spread": mark,
+                    "invalid_bounds": invalid, "outside_quote": outside,
+                    "bounds_adjustment": (min(max(mark, 0), width) - mark) * count * 100,
+                    "reference_spread": estimate, "signed_valuation_difference": difference,
+                    "method": method,
+                    "warning": "Not executable; quotes may be stale. Not added to day-P/L totals.",
+                })
+    return pd.DataFrame(rows)
 
 
 def find_bad_itm_upday_call_spreads(options, quotes, max_call_width=10.0):
@@ -846,6 +912,7 @@ def main():
             min_excess=args.baseline_min_excess,
             timeout=args.cboe_timeout,
         )
+    current_mark_diagnostics = audit_current_call_marks(options, option_quote_details)
     puts = check_otm_short_puts(
         naked_puts,
         quotes,
@@ -952,9 +1019,11 @@ def main():
     option_quote_summary.to_csv(option_quote_summary_path, index=False)
     option_quote_errors.to_csv(option_quote_errors_path, index=False)
     summary.to_csv(summary_path, index=False)
+    current_mark_diagnostics.to_csv(outdir / "current_call_mark_diagnostics.csv", index=False)
 
     with pd.ExcelWriter(xlsx_path, engine="openpyxl") as w:
         summary.to_excel(w, index=False, sheet_name="Summary")
+        current_mark_diagnostics.to_excel(w, index=False, sheet_name="Current Call Marks")
         bad_calls.to_excel(w, index=False, sheet_name="ITM Call Adjustments")
         puts.to_excel(w, index=False, sheet_name="OTM Naked Short Puts")
         put_spreads.to_excel(w, index=False, sheet_name="OTM Up-Day Put Spreads")
@@ -966,6 +1035,15 @@ def main():
 
     print("\nFINAL PORTFOLIO NOISE CHECK v2")
     print("=" * 72)
+    print("\nCURRENT CALL MARK DIAGNOSTICS (all tickers, including profitable books):")
+    print("Signed valuation scenarios, NOT additional day-P/L addbacks; do not sum overlapping columns.")
+    print("Trade allocation is inferred; wide/stale quotes and theoretical prices are not executable.")
+    if current_mark_diagnostics.empty:
+        print("No issues detected by these checks; this is not full quote validation.")
+    else:
+        print(current_mark_diagnostics.drop(columns=["warning"]).to_string(index=False))
+    if not option_quote_errors.empty:
+        print(f"Quote coverage warnings: {len(option_quote_errors)}; see option_quote_baseline_errors.csv")
 
     print("\nCALL SPREAD RULE:")
     print(f"  Negative day P/L with stock above the short strike; width <= ${args.max_call_width:g}; stock up OR both closes above the short strike.")
