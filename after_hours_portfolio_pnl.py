@@ -19,7 +19,7 @@ import re
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from io import StringIO
-from datetime import datetime, time, timedelta, timezone
+from datetime import datetime, time, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
@@ -42,7 +42,7 @@ from option_math import bs_price, implied_volatility
 RISK_FREE_RATE = float(config_value("market.risk_free_rate", 0.045))
 DIVIDEND_YIELD = float(config_value("market.dividend_yield", 0.0))
 UTC = timezone.utc
-EASTERN_OFFSET = timezone(timedelta(hours=-4))
+EASTERN_OFFSET = ZoneInfo("America/New_York")
 HYPERLIQUID_INFO_URL = "https://api.hyperliquid.xyz/info"
 DRAM_HOLDINGS_URL = "https://stockanalysis.com/etf/dram/holdings/"
 ROBINHOOD_QUOTE_URLS = (
@@ -239,7 +239,7 @@ def build_batch_quote_cache(tickers: list[str]) -> dict[str, dict[str, float | s
         hist = yf.download(
             tickers=valid_tickers,
             period="2d",
-            interval="5m",
+            interval="1m",
             prepost=True,
             progress=False,
             auto_adjust=False,
@@ -314,7 +314,7 @@ def build_batch_quote_cache(tickers: list[str]) -> dict[str, dict[str, float | s
                 lambda ts: REGULAR_CLOSE <= ts.timetz().replace(tzinfo=None) < POST_MARKET_CLOSE
             )
         ]
-        if not post_frame.empty:
+        if not post_frame.empty and latest_date == now_eastern().date():
             post = float(post_frame["price"].iloc[-1])
             post_source = "yahoo_post"
             extended_hours_session = "post_market"
@@ -324,7 +324,7 @@ def build_batch_quote_cache(tickers: list[str]) -> dict[str, dict[str, float | s
                 lambda ts: PREMARKET_START <= ts.timetz().replace(tzinfo=None) < REGULAR_OPEN
             )
         ]
-        if not premarket_frame.empty:
+        if not premarket_frame.empty and latest_date == now_eastern().date():
             premarket = float(premarket_frame["price"].iloc[-1])
             premarket_source = "yahoo_pre"
             premarket_session = "overnight_pre_market"
@@ -351,6 +351,8 @@ def build_batch_quote_cache(tickers: list[str]) -> dict[str, dict[str, float | s
             overnight_session = "overnight"
 
         out[str(ticker).upper()] = {
+            "yahoo_post_asof": post_frame.index[-1].isoformat() if post is not None else None,
+            "yahoo_pre_asof": premarket_frame.index[-1].isoformat() if premarket is not None else None,
             "regular": regular,
             "previous_close": previous_close,
             "post": post,
@@ -517,6 +519,8 @@ def fetch_quote_snapshot(ticker: str, *, allow_numeric_symbol: bool = False) -> 
         "premarket_source": premarket_source,
         "premarket_session": premarket_session,
         "overnight_timestamp": robinhood_quote.get("timestamp"),
+        "yahoo_post_asof": (batch_quote or {}).get("yahoo_post_asof"),
+        "yahoo_pre_asof": (batch_quote or {}).get("yahoo_pre_asof"),
     }
 
 
@@ -562,6 +566,8 @@ def choose_after_hours_price(
         if not prefer_perp:
             return None, None
 
+    if current_extended_session_bucket() == "pre_market" and quote.get("premarket") is not None:
+        return quote["premarket"], quote.get("premarket_source")
     after_hours_price = quote.get("post")
     after_hours_source = quote.get("post_source")
     if after_hours_price is None:
@@ -608,6 +614,7 @@ def fetch_hyperliquid_perp_snapshots(dex: str = "") -> dict[str, dict[str, float
         price_source = "hyperliquid_mid"
 
         out[symbol] = {
+            "prev_day_price": context.get("prevDayPx"),
             "ticker": symbol,
             "symbol": symbol,
             "synthetic_price": float(synthetic_price) if not pd.isna(synthetic_price) else None,
@@ -616,6 +623,35 @@ def fetch_hyperliquid_perp_snapshots(dex: str = "") -> dict[str, dict[str, float
             "dex": dex,
         }
     return out
+
+
+def print_index_perps():
+    """Display index and oil perps without including them in portfolio valuation."""
+    quotes = fetch_hyperliquid_perp_snapshots(dex="xyz")
+    rows = []
+    for label, symbol in (
+        ("NAS PERP", "XYZ:XYZ100"),
+        ("SPX PERP", "XYZ:SP500"),
+        ("WTI OIL PERP", "XYZ:CL"),
+        ("BRENT OIL PERP", "XYZ:BRENTOIL"),
+    ):
+        quote = quotes.get(symbol, {})
+        price = pd.to_numeric(quote.get("mid_price"), errors="coerce")
+        previous = pd.to_numeric(quote.get("prev_day_price"), errors="coerce")
+        valid = pd.notna(price) and math.isfinite(price) and price > 0
+        baseline_valid = pd.notna(previous) and math.isfinite(previous) and previous > 0
+        change = price - previous if valid and baseline_valid else float("nan")
+        rows.append({
+            "market": label,
+            "symbol": symbol,
+            "mid": price if valid else float("nan"),
+            "change_24h": change,
+            "change_24h_pct": change / previous * 100 if baseline_valid else float("nan"),
+            "status": "available" if valid else "unavailable",
+        })
+    print("\nIndex & Oil Perps (Hyperliquid xyz)")
+    print("24-hour change versus venue prevDayPx; NOT exchange-close change or CME futures.")
+    print(pd.DataFrame(rows).to_string(index=False, na_rep="N/A", float_format=lambda v: f"{v:,.2f}"))
 
 
 def choose_direct_perp_price(
@@ -993,6 +1029,7 @@ def build_after_hours_report(
                 "perp_index_price": perp_quote.get("index_price"),
                 "perp_last_price": perp_quote.get("last_price"),
                 "leveraged_proxy_underlying": leveraged_proxy_cache.get(ticker, {}).get("underlying") if ticker in LEVERAGED_PROXY_MAP else None,
+                "bar_asof_et": quote.get(f"{after_hours_source}_asof") if not overnight else None,
                 "leveraged_proxy_leverage": leveraged_proxy_cache.get(ticker, {}).get("leverage") if ticker in LEVERAGED_PROXY_MAP else None,
                 "etf_proxy_coverage_pct": float(etf_proxy_cache.get(ticker, {}).get("covered_weight", 0.0)) * 100.0 if ticker in ETF_PROXY_CONFIG and etf_proxy_cache.get(ticker) else None,
                 "current_market_value": market_value,
@@ -1008,6 +1045,7 @@ def build_after_hours_report(
         .agg(
             current_market_value=("current_market_value", "sum"),
             extended_price_used=("after_hours_underlying", first_non_null),
+            bar_asof_et=("bar_asof_et", first_non_null),
             extended_price_source=("after_hours_source", first_non_null),
             estimated_ah_pl=("estimated_ah_pl", "sum"),
         )
@@ -1118,6 +1156,7 @@ def main() -> int:
     args = parser.parse_args()
 
     csv_path = default_csv_path(args.file or args.csv, __file__)
+    print_index_perps()
     if args.list_perps:
         holdings = load_schwab_holdings(csv_path)
         held = sorted(set(holdings["Underlying"].dropna().astype(str).str.upper()))
