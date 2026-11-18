@@ -309,12 +309,15 @@ def build_batch_quote_cache(tickers: list[str]) -> dict[str, dict[str, float | s
         premarket_source = None
         premarket_session = None
 
-        post_frame = latest_day_frame[
-            latest_day_frame.index.map(
+        # Keep the completed session's AH print after midnight ET. Its date
+        # follows the regular-session anchor, not the wall-clock calendar day.
+        post_day_frame = frame[frame.index.date == regular_dates[-1]] if regular_dates else frame.iloc[0:0]
+        post_frame = post_day_frame[
+            post_day_frame.index.map(
                 lambda ts: REGULAR_CLOSE <= ts.timetz().replace(tzinfo=None) < POST_MARKET_CLOSE
             )
         ]
-        if not post_frame.empty and latest_date == now_eastern().date():
+        if not post_frame.empty:
             post = float(post_frame["price"].iloc[-1])
             post_source = "yahoo_post"
             extended_hours_session = "post_market"
@@ -345,7 +348,7 @@ def build_batch_quote_cache(tickers: list[str]) -> dict[str, dict[str, float | s
                 ]
         else:
             overnight_frame = latest_day_frame.iloc[0:0]
-        if not overnight_frame.empty:
+        if not overnight_frame.empty and latest_date == now_eastern().date():
             overnight = float(overnight_frame["price"].iloc[-1])
             overnight_source = "yahoo_pre"
             overnight_session = "overnight"
@@ -367,6 +370,18 @@ def build_batch_quote_cache(tickers: list[str]) -> dict[str, dict[str, float | s
             "exchange": None,
         }
     return out
+
+
+def print_final_ah_quotes() -> None:
+    print("\nFinal Available After-Hours Quotes (not premarket or perps)")
+    for ticker in ("XLK", "SPY", "QQQ"):
+        quote = _BATCH_QUOTES.get(ticker, {})
+        price = quote.get("post")
+        timestamp = quote.get("yahoo_post_asof")
+        if price is None or pd.isna(price) or not timestamp:
+            print(f"{ticker}: N/A (no after-hours quote available)")
+        else:
+            print(f"{ticker}: ${price:,.2f} | As of {timestamp}")
 
 
 def fetch_quote_snapshot(ticker: str, *, allow_numeric_symbol: bool = False) -> dict[str, float | str | None]:
@@ -880,6 +895,7 @@ def build_after_hours_report(
     set_use_robinhood(use_robinhood)
 
     unique_tickers = {str(ticker).strip().upper() for ticker in holdings["Underlying"].dropna().astype(str)}
+    unique_tickers.update({"XLK", "SPY", "QQQ"})
     unique_tickers.update(
         str(meta.get("underlying") or "").strip().upper()
         for meta in LEVERAGED_PROXY_MAP.values()
@@ -888,8 +904,7 @@ def build_after_hours_report(
     if "DRAM" in unique_tickers:
         unique_tickers.update({"MU", "SNDK", "STX", "WDC", "000660.KS", "005930.KS", "285A.T", "2408.TW", "2344.TW", "603986.SS"})
     batch_quotes = build_batch_quote_cache(sorted(unique_tickers))
-    if batch_quotes:
-        set_batch_quotes(batch_quotes)
+    set_batch_quotes(batch_quotes)
 
     quote_cache: dict[str, dict[str, float | str | None]] = {}
     perp_cache = fetch_equity_perp_snapshots()
@@ -948,15 +963,9 @@ def build_after_hours_report(
             if leveraged_proxy:
                 proxy_return = float(leveraged_proxy["leveraged_return"])
 
-                proxy_meta = LEVERAGED_PROXY_MAP.get(ticker, {})
-                max_gap = proxy_meta.get("max_direct_ah_proxy_gap")
                 use_proxy = prefer_perp or after_hours_price is None
-                if max_gap is not None:
-                    # QQQI/XQQI are QQQ covered-call income ETFs whose own AH
-                    # prints are thin/stale and can even print the wrong sign
-                    # vs QQQ. The QQQ proxy is authoritative: always prefer it
-                    # when available.
-                    use_proxy = True
+                # A QQQ return estimate is not an executable ETF quote. Use
+                # the ETF's own print unless a proxy was explicitly requested.
 
                 if use_proxy:
                     after_hours_price = regular_price * (1.0 + proxy_return)
@@ -1307,6 +1316,8 @@ def main() -> int:
 
     print("\nAfter-Hours / Overnight Portfolio Estimate")
     print("=" * 88)
+    print("Check bar_asof_et: completed-session AH prints are not live overnight quotes.")
+    print("Option P/L is modeled from the underlying move, not executable option quotes.")
     print("\nBy Ticker")
     print(by_ticker.to_string(index=False))
     print("\nTotals")
@@ -1314,6 +1325,7 @@ def main() -> int:
     print(f"Estimated After-Hours P/L: ${total_ah_pl:,.2f}")
     if total_market_value:
         print(f"Estimated After-Hours Return: {100.0 * total_ah_pl / total_market_value:.4f}%")
+    print_final_ah_quotes()
 
     futures = fetch_index_futures_snapshot()
     if not futures.empty:
