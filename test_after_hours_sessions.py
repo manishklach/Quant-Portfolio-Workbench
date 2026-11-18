@@ -30,6 +30,18 @@ class ExtendedSessionTests(unittest.TestCase):
         ):
             return ah.build_batch_quote_cache(["XLK"])["XLK"]
 
+    def test_summary_signed_changes_and_invalid_baseline(self):
+        quotes = {
+            "XLK": {"post": 102.0, "regular": 100.0, "yahoo_post_asof": "2026-11-17T19:59:00-05:00"},
+            "SPY": {"post": 495.0, "regular": 500.0, "yahoo_post_asof": "2026-11-17T19:59:00-05:00"},
+            "QQQ": {"post": 600.0, "regular": 0.0, "yahoo_post_asof": "2026-11-17T19:59:00-05:00"},
+        }
+        with patch.object(ah, "_BATCH_QUOTES", quotes), patch("sys.stdout", new_callable=StringIO) as output:
+            ah.print_final_ah_quotes()
+        self.assertIn("+2.00 USD (+2.00%)", output.getvalue())
+        self.assertIn("-5.00 USD (-1.00%)", output.getvalue())
+        self.assertIn("N/A (no closing reference)", output.getvalue())
+
     def test_completed_postmarket_survives_midnight(self):
         quote = self.quotes(
             "2026-11-18T00:30:00-05:00",

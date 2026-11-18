@@ -374,6 +374,7 @@ def build_batch_quote_cache(tickers: list[str]) -> dict[str, dict[str, float | s
 
 def print_final_ah_quotes() -> None:
     print("\nFinal Available After-Hours Quotes (not premarket or perps)")
+    print("Change versus last regular-session bar (closing reference), per share.")
     for ticker in ("XLK", "SPY", "QQQ"):
         quote = _BATCH_QUOTES.get(ticker, {})
         price = quote.get("post")
@@ -381,7 +382,13 @@ def print_final_ah_quotes() -> None:
         if price is None or pd.isna(price) or not timestamp:
             print(f"{ticker}: N/A (no after-hours quote available)")
         else:
-            print(f"{ticker}: ${price:,.2f} | As of {timestamp}")
+            regular = quote.get("regular")
+            if regular is not None and math.isfinite(regular) and regular > 0:
+                change = price - regular
+                move = f"{change:+,.2f} USD ({100.0 * change / regular:+.2f}%)"
+            else:
+                move = "N/A (no closing reference)"
+            print(f"{ticker}: ${price:,.2f} | AH change: {move} | As of {timestamp}")
 
 
 def fetch_quote_snapshot(ticker: str, *, allow_numeric_symbol: bool = False) -> dict[str, float | str | None]:
