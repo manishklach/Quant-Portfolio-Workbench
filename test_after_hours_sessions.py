@@ -9,6 +9,27 @@ import after_hours_portfolio_pnl as ah
 
 
 class ExtendedSessionTests(unittest.TestCase):
+    def test_xqqi_proxy_uses_qqqi_percentage_return(self):
+        quotes = {
+            "XQQI": {"regular": 40.0, "regular_date": "2026-11-17"},
+            "QQQI": {"regular": 50.0, "post": 50.5, "post_source": "yahoo_post", "regular_date": "2026-11-17", "yahoo_post_asof": "2026-11-17T19:59:00-05:00"},
+        }
+        with patch.object(ah, "current_extended_session_bucket", return_value="overnight"):
+            result = ah.build_leveraged_proxy_snapshot("XQQI", {}, False, quotes)
+        self.assertAlmostEqual(result["leveraged_return"], 0.015)
+        self.assertAlmostEqual(40 * (1 + result["leveraged_return"]), 40.60)
+        self.assertEqual(result["underlying"], "QQQI")
+        quotes["XQQI"]["regular_date"] = "2026-11-16"
+        self.assertEqual(ah.build_leveraged_proxy_snapshot("XQQI", {}, False, quotes), {})
+
+    def test_xqqi_rejects_ah_fallback_during_premarket(self):
+        quotes = {
+            "XQQI": {"regular_date": "2026-11-17"},
+            "QQQI": {"regular": 50.0, "post": 51.0, "post_source": "yahoo_post", "regular_date": "2026-11-17", "yahoo_post_asof": "2026-11-17T19:59:00-05:00"},
+        }
+        with patch.object(ah, "current_extended_session_bucket", return_value="pre_market"):
+            self.assertEqual(ah.build_leveraged_proxy_snapshot("XQQI", {}, False, quotes), {})
+
     def test_summary_uses_only_after_hours_and_handles_missing(self):
         quotes = {
             "XLK": {"post": 166.88, "yahoo_post_asof": "2026-11-17T19:56:00-05:00", "premarket": 170.0},

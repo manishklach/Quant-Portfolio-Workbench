@@ -73,7 +73,7 @@ DRAM_PROXY_MAP = {
 LEVERAGED_PROXY_MAP = {
     "MUU": {"underlying": "MU", "leverage": 2.0, "label": "Direxion Daily MU Bull 2X ETF"},
     "QQQI": {"underlying": "QQQ", "leverage": 1.0, "label": "QQQ Income ETF proxy", "max_direct_ah_proxy_gap": 0.0075},
-    "XQQI": {"underlying": "QQQ", "leverage": 1.0, "label": "QQQ Income ETF proxy", "max_direct_ah_proxy_gap": 0.0075},
+    "XQQI": {"underlying": "QQQI", "leverage": 1.5, "label": "Estimated 1.5x QQQI return", "prefer_proxy": True},
 }
 
 REGULAR_OPEN = time(9, 30)
@@ -354,6 +354,7 @@ def build_batch_quote_cache(tickers: list[str]) -> dict[str, dict[str, float | s
             overnight_session = "overnight"
 
         out[str(ticker).upper()] = {
+            "regular_date": str(regular_dates[-1]) if regular_dates else None,
             "yahoo_post_asof": post_frame.index[-1].isoformat() if post is not None else None,
             "yahoo_pre_asof": premarket_frame.index[-1].isoformat() if premarket is not None else None,
             "regular": regular,
@@ -541,6 +542,7 @@ def fetch_quote_snapshot(ticker: str, *, allow_numeric_symbol: bool = False) -> 
         "premarket_source": premarket_source,
         "premarket_session": premarket_session,
         "overnight_timestamp": robinhood_quote.get("timestamp"),
+        "regular_date": (batch_quote or {}).get("regular_date"),
         "yahoo_post_asof": (batch_quote or {}).get("yahoo_post_asof"),
         "yahoo_pre_asof": (batch_quote or {}).get("yahoo_pre_asof"),
     }
@@ -835,6 +837,21 @@ def build_leveraged_proxy_snapshot(
     if regular is None or after_hours_price is None or regular == 0:
         return {}
 
+    if ticker == "XQQI":
+        target = quote_cache.get(ticker, {})
+        session = current_extended_session_bucket()
+        expected_source = "yahoo_pre" if session == "pre_market" else "yahoo_post"
+        timestamp = quote.get(f"{expected_source}_asof")
+        # Do not substitute a perp or yesterday's AH print for current premarket.
+        if after_hours_source != expected_source or not timestamp:
+            return {}
+        if not target.get("regular_date") or target.get("regular_date") != quote.get("regular_date"):
+            return {}
+        if session == "pre_market":
+            age = now_eastern() - datetime.fromisoformat(str(timestamp))
+            if age.total_seconds() < 0 or age.total_seconds() > 900:
+                return {}
+
     underlying_return = (after_hours_price - regular) / regular
     leveraged_return = leverage * underlying_return
     return {
@@ -847,6 +864,7 @@ def build_leveraged_proxy_snapshot(
         "leveraged_return": leveraged_return,
         "source": f"leveraged_proxy_{underlying}",
         "underlying_source": after_hours_source,
+        "asof": quote.get(f"{after_hours_source}_asof"),
         "label": proxy_meta.get("label"),
     }
 
@@ -970,7 +988,7 @@ def build_after_hours_report(
             if leveraged_proxy:
                 proxy_return = float(leveraged_proxy["leveraged_return"])
 
-                use_proxy = prefer_perp or after_hours_price is None
+                use_proxy = prefer_perp or after_hours_price is None or LEVERAGED_PROXY_MAP[ticker].get("prefer_proxy", False)
                 # A QQQ return estimate is not an executable ETF quote. Use
                 # the ETF's own print unless a proxy was explicitly requested.
 
@@ -1045,7 +1063,7 @@ def build_after_hours_report(
                 "perp_index_price": perp_quote.get("index_price"),
                 "perp_last_price": perp_quote.get("last_price"),
                 "leveraged_proxy_underlying": leveraged_proxy_cache.get(ticker, {}).get("underlying") if ticker in LEVERAGED_PROXY_MAP else None,
-                "bar_asof_et": quote.get(f"{after_hours_source}_asof") if not overnight else None,
+                "bar_asof_et": leveraged_proxy_cache.get(ticker, {}).get("asof") if str(after_hours_source).startswith("leveraged_proxy_") else quote.get(f"{after_hours_source}_asof") if not overnight else None,
                 "leveraged_proxy_leverage": leveraged_proxy_cache.get(ticker, {}).get("leverage") if ticker in LEVERAGED_PROXY_MAP else None,
                 "etf_proxy_coverage_pct": float(etf_proxy_cache.get(ticker, {}).get("covered_weight", 0.0)) * 100.0 if ticker in ETF_PROXY_CONFIG and etf_proxy_cache.get(ticker) else None,
                 "current_market_value": market_value,
@@ -1325,6 +1343,7 @@ def main() -> int:
     print("=" * 88)
     print("Check bar_asof_et: completed-session AH prints are not live overnight quotes.")
     print("Option P/L is modeled from the underlying move, not executable option quotes.")
+    print("XQQI prefers a 1.5x QQQI percentage-return estimate when available; not a traded quote or distribution-adjusted return.")
     print("\nBy Ticker")
     print(by_ticker.to_string(index=False))
     print("\nTotals")
